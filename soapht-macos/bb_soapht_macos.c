@@ -315,6 +315,17 @@ static void free_image(struct bb_state *st)
     st->jpeg_off = 0;
 }
 
+static int mm_fixed_to_thou(SANE_Fixed value)
+{
+    double mm = SANE_UNFIX(value);
+    double thou = (mm / 25.4) * 1000.0;
+
+    if (thou < 0.0)
+        thou = 0.0;
+
+    return (int)(thou + 0.5);
+}
+
 static void setup_capabilities(struct soap_session *ps)
 {
     memset(ps->scanModeList, 0, sizeof(ps->scanModeList));
@@ -605,16 +616,43 @@ int bb_start_scan(struct soap_session *ps)
             return 1;
     }
 
-    const char *source_name = is_adf ? "ADF" : "Platen";
+const char *source_name = is_adf ? "ADF" : "Platen";
 
+int x_offset = mm_fixed_to_thou(ps->effectiveTlx);
+int y_offset = mm_fixed_to_thou(ps->effectiveTly);
+
+int media_width =
+    mm_fixed_to_thou(ps->effectiveBrx - ps->effectiveTlx);
+
+int media_height =
+    mm_fixed_to_thou(ps->effectiveBry - ps->effectiveTly);
+
+/* Fallback for uninitialized/invalid geometry. */
+if (media_width <= 0)
+    media_width = 8499;
+
+if (media_height <= 0)
+    media_height = 11689;
+
+/* Clamp to scanner hardware limits. */
+if (media_width > M127_ADF_WIDTH_THOU)
+    media_width = M127_ADF_WIDTH_THOU;
+
+if (is_adf) {
     /*
-     * The scanner advertises ADF media up to 14 inches, but using the
-     * maximum unconditionally adds a large blank tail to A4/Letter pages.
-     * Keep the current default at the tested 8.5 x 11.689 inch region.
-     * A later revision can derive this from SANE geometry options.
+     * HPLIP initializes the ADF geometry to its advertised maximum
+     * 14-inch height. That produces an unnecessary blank tail for the
+     * normal default scan, so retain the tested A4-ish default.
      */
-    const int media_width = 8499;
-    const int media_height = 11689;
+    if (media_height >= M127_ADF_HEIGHT_THOU - 1)
+        media_height = 11689;
+
+    if (media_height > M127_ADF_HEIGHT_THOU)
+        media_height = M127_ADF_HEIGHT_THOU;
+} else {
+    if (media_height > M127_PLATEN_HEIGHT_THOU)
+        media_height = M127_PLATEN_HEIGHT_THOU;
+}
 
     char inner[4096];
     int n = snprintf(
@@ -640,8 +678,8 @@ int bb_start_scan(struct soap_session *ps)
         "</ExposureSettings></Exposure>"
         "<MediaSides><MediaFront>"
         "<ScanRegion>"
-        "<ScanRegionXOffset>0</ScanRegionXOffset>"
-        "<ScanRegionYOffset>0</ScanRegionYOffset>"
+        "<ScanRegionXOffset>%d</ScanRegionXOffset>"
+        "<ScanRegionYOffset>%d</ScanRegionYOffset>"
         "<ScanRegionWidth>%d</ScanRegionWidth>"
         "<ScanRegionHeight>%d</ScanRegionHeight>"
         "</ScanRegion>"
@@ -660,6 +698,8 @@ int bb_start_scan(struct soap_session *ps)
         media_height,
         ps->currentContrast,
         ps->currentBrightness,
+       x_offset,
+       y_offset,
         media_width,
         media_height,
         color_processing,
