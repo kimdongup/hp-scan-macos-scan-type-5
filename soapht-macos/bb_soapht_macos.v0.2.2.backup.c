@@ -39,12 +39,6 @@
 #define M127_MIN_WIDTH_THOU      1920
 #define M127_MIN_HEIGHT_THOU     1920
 
-#define M127_ADF_WIDTH_THOU       8500
-#define M127_ADF_HEIGHT_THOU     14000
-#define M127_ADF_MIN_WIDTH_THOU   1920
-#define M127_ADF_MIN_HEIGHT_THOU  1920
-
-
 struct bb_state {
     int job_id;
     int job_active;
@@ -330,12 +324,8 @@ static void setup_capabilities(struct soap_session *ps)
 
     memset(ps->inputSourceList, 0, sizeof(ps->inputSourceList));
     memset(ps->inputSourceMap, 0, sizeof(ps->inputSourceMap));
-
     ps->inputSourceList[0] = "Flatbed";
     ps->inputSourceMap[0] = IS_PLATEN;
-
-ps->inputSourceList[1] = "ADF";
-ps->inputSourceMap[1] = IS_ADF;
 
     memset(ps->resolutionList, 0, sizeof(ps->resolutionList));
     memset(ps->platen_resolutionList, 0, sizeof(ps->platen_resolutionList));
@@ -365,40 +355,14 @@ ps->inputSourceMap[1] = IS_ADF;
     ps->platen_tlyRange.quant = 0;
     ps->platen_bryRange = ps->platen_tlyRange;
 
-    /* ADF */
-memset(&ps->adf_tlxRange, 0, sizeof(ps->adf_tlxRange));
-memset(&ps->adf_tlyRange, 0, sizeof(ps->adf_tlyRange));
-memset(&ps->adf_brxRange, 0, sizeof(ps->adf_brxRange));
-memset(&ps->adf_bryRange, 0, sizeof(ps->adf_bryRange));
-memset(ps->adf_resolutionList, 0, sizeof(ps->adf_resolutionList));
-
-ps->adf_resolutionList[0] = 2;
-ps->adf_resolutionList[1] = 150;
-ps->adf_resolutionList[2] = 300;
-
-ps->adf_min_width =
-    thou_to_mm_fixed(M127_ADF_MIN_WIDTH_THOU);
-
-ps->adf_min_height =
-    thou_to_mm_fixed(M127_ADF_MIN_HEIGHT_THOU);
-
-SANE_Fixed adf_maxw =
-    thou_to_mm_fixed(M127_ADF_WIDTH_THOU);
-
-SANE_Fixed adf_maxh =
-    thou_to_mm_fixed(M127_ADF_HEIGHT_THOU);
-
-ps->adf_tlxRange.min = 0;
-ps->adf_tlxRange.max = adf_maxw;
-ps->adf_tlxRange.quant = 0;
-
-ps->adf_brxRange = ps->adf_tlxRange;
-
-ps->adf_tlyRange.min = 0;
-ps->adf_tlyRange.max = adf_maxh;
-ps->adf_tlyRange.quant = 0;
-
-ps->adf_bryRange = ps->adf_tlyRange;
+    /* No ADF in v0.1 even though hardware supports it. */
+    ps->adf_min_width = 0;
+    ps->adf_min_height = 0;
+    memset(&ps->adf_tlxRange, 0, sizeof(ps->adf_tlxRange));
+    memset(&ps->adf_tlyRange, 0, sizeof(ps->adf_tlyRange));
+    memset(&ps->adf_brxRange, 0, sizeof(ps->adf_brxRange));
+    memset(&ps->adf_bryRange, 0, sizeof(ps->adf_bryRange));
+    memset(ps->adf_resolutionList, 0, sizeof(ps->adf_resolutionList));
 
     ps->jpegQualityRange.min = 0;
     ps->jpegQualityRange.max = 100;
@@ -518,138 +482,20 @@ int bb_get_parameters(struct soap_session *ps, SANE_Parameters *pp,
 __attribute__((visibility("default")))
 int bb_is_paper_in_adf(struct soap_session *ps)
 {
-    if (!ps)
-        return -1;
-
-    char *xml = make_envelope(
-        "<wscn:GetScannerElements></wscn:GetScannerElements>");
-
-    if (!xml)
-        return -1;
-
-    unsigned char *resp = NULL;
-    size_t resp_len = 0;
-
-    int rc = soap_transaction(
-        ps,
-        xml,
-        &resp,
-        &resp_len,
-        SOAPHT_TIMEOUT);
-
-    free(xml);
-
-    if (rc || !resp) {
-        free(resp);
-        return -1;
-    }
-
-    fprintf(stderr,
-            "[soapht-plugin] ADF status response (%zu bytes):\n%.*s\n",
-            resp_len,
-            (int)resp_len,
-            (char *)resp);
-
-    int result = -1;
-
-    if (strstr((char *)resp,
-               "<PaperInADF>true</PaperInADF>")) {
-        result = 1;
-    }
-    else if (strstr((char *)resp,
-                    "<PaperInADF>false</PaperInADF>")) {
-        result = 0;
-    }
-
-    fprintf(stderr,
-            "[soapht-plugin] PaperInADF result=%d\n",
-            result);
-
-    free(resp);
-    return result;
+    (void)ps;
+    return 0; /* v0.1: platen only */
 }
 
 __attribute__((visibility("default")))
 int bb_start_scan(struct soap_session *ps)
 {
-    fprintf(stderr,
-            "[soapht-plugin] bb_start_scan ENTER ps=%p bb_session=%p "
-            "source=%d resolution=%d mode=%d compression=%d\n",
-            (void *)ps,
-            ps ? ps->bb_session : NULL,
-            ps ? ps->currentInputSource : -1,
-            ps ? ps->currentResolution : -1,
-            ps ? ps->currentScanMode : -1,
-            ps ? ps->currentCompression : -1);
-
-    if (!ps || !ps->bb_session) {
-        fprintf(stderr,
-                "[soapht-plugin] bb_start_scan FAIL: invalid session\n");
-        return 1;
-    }
-
-    struct bb_state *st =
-        (struct bb_state *)ps->bb_session;
-
     if (!ps || !ps->bb_session) return 1;
 
-fprintf(stderr,
-        "[soapht-plugin] bb_start_scan state "
-        "job_id=%d job_active=%d source=%d\n",
-        st->job_id,
-        st->job_active,
-        ps->currentInputSource);
+    struct bb_state *st = (struct bb_state *)ps->bb_session;
 
-int is_adf =
-    (ps->currentInputSource == IS_ADF ||
-     ps->currentInputSource == IS_ADF_DUPLEX);
-
-fprintf(stderr,
-        "[soapht-plugin] is_adf=%d\n",
-        is_adf);
-
-const char *source_name =
-    is_adf ? "ADF" : "Platen";
-
-int media_width;
-int media_height;
-
-if (is_adf) {
-    media_width = 8499;
-    media_height = 13999;
-}
-else {
-    media_width = 8499;
-    media_height = 11689;
-}
-
-/* 이전 페이지 이미지 버퍼는 버린다. */
-free_image(st);
-
-/* 페이지 단위 정보는 초기화한다. */
-st->pixels_per_line = 0;
-st->lines = 0;
-st->bytes_per_line = 0;
-
-/*
- * ADF batch 중이고 기존 JobId가 살아 있으면
- * 새 CreateScanJob을 만들지 않는다.
- */
-if (is_adf &&
-    st->job_active &&
-    st->job_id > 0) {
-  
- fprintf(stderr,
-            "[soapht-plugin] reusing ADF JobId=%d\n",
-            st->job_id);
-
-    return 0;
-}
-
-/* Flatbed 또는 새로운 ADF batch일 때만 새 job 준비 */
-st->job_id = 0;
-st->job_active = 0;
-
+    free_image(st);
+    st->job_id = 0;
+    st->job_active = 0;
     st->pixels_per_line = 0;
     st->lines = 0;
     st->bytes_per_line = 0;
@@ -658,6 +504,8 @@ st->job_active = 0;
      * v0.2 supports Platen + JFIF with 150/300/600 dpi and
      * GrayScale8/RGB24.
      */
+    if (ps->currentInputSource != IS_PLATEN)
+        return 1;
 
     if (ps->currentCompression != SF_JFIF)
         ps->currentCompression = SF_JFIF;
@@ -693,10 +541,10 @@ st->job_active = 0;
         "<Format>jfif</Format>"
         "<CompressionQualityFactor>0</CompressionQualityFactor>"
         "<ImagesToTransfer>0</ImagesToTransfer>"
-        "<InputSource>%s</InputSource>"
+        "<InputSource>Platen</InputSource>"
         "<ContentType>Auto</ContentType>"
         "<InputSize><InputMediaSize>"
-        "<Width>%d</Width><Height>%d</Height>"
+        "<Width>8499</Width><Height>11689</Height>"
         "</InputMediaSize>"
         "<DocumentSizeAutoDetect>false</DocumentSizeAutoDetect>"
         "</InputSize>"
@@ -709,8 +557,8 @@ st->job_active = 0;
         "<ScanRegion>"
         "<ScanRegionXOffset>0</ScanRegionXOffset>"
         "<ScanRegionYOffset>0</ScanRegionYOffset>"
-        "<ScanRegionWidth>%d</ScanRegionWidth>"
-        "<ScanRegionHeight>%d</ScanRegionHeight>"
+        "<ScanRegionWidth>8499</ScanRegionWidth>"
+        "<ScanRegionHeight>11689</ScanRegionHeight>"
         "</ScanRegion>"
         "<ColorProcessing>%s</ColorProcessing>"
         "<Resolution><Width>%d</Width><Height>%d</Height></Resolution>"
@@ -722,21 +570,12 @@ st->job_active = 0;
         "</ScanManufacturingParameters>"
         "</ScanTicket>"
         "</wscn:CreateScanJobRequest>",
-        source_name,
-        media_width,
-        media_height,
         ps->currentContrast,
         ps->currentBrightness,
-        media_width,
-        media_height,
         color_processing,
         ps->currentResolution,
         ps->currentResolution
     );
-
-fprintf(stderr,
-        "[soapht-plugin] CreateScanJob request:\n%s\n",
-        inner);
 
     if (n < 0 || (size_t)n >= sizeof(inner))
         return 1;
@@ -750,62 +589,18 @@ fprintf(stderr,
     int rc = soap_transaction(
         ps, xml, &resp, &resp_len, SOAPHT_TIMEOUT);
 
-fprintf(stderr,
-        "[soapht-plugin] CreateScanJob transaction rc=%d resp_len=%zu\n",
-        rc, resp_len);
+    free(xml);
 
-free(xml);
+    if (rc)
+        return 1;
 
-if (rc) {
-    fprintf(stderr,
-            "[soapht-plugin] CreateScanJob FAILED at HTTP transaction\n");
-    free(resp);
-    return 1;
-}
-
-fprintf(stderr,
-        "[soapht-plugin] CreateScanJob response:\n%.*s\n",
-        (int)resp_len,
-        (char *)resp);
-
-if (tag_int((char *)resp, "JobId", &st->job_id)) {
-    fprintf(stderr, "[soapht-plugin] missing JobId\n");
-    free(resp);
-    return 1;
-}
-
-if (tag_int((char *)resp,
-            "PixelsPerLine",
-            &st->pixels_per_line)) {
-    fprintf(stderr, "[soapht-plugin] missing PixelsPerLine\n");
-    free(resp);
-    return 1;
-}
-
-if (tag_int((char *)resp,
-            "NumberOfLines",
-            &st->lines)) {
-    fprintf(stderr, "[soapht-plugin] missing NumberOfLines\n");
-    free(resp);
-    return 1;
-}
-
-if (tag_int((char *)resp,
-            "BytesPerLine",
-            &st->bytes_per_line)) {
-    fprintf(stderr, "[soapht-plugin] missing BytesPerLine\n");
-    free(resp);
-    return 1;
-}
-
-fprintf(stderr,
-        "[soapht-plugin] CreateScanJob OK "
-        "job=%d pixels=%d lines=%d bpl=%d\n",
-        st->job_id,
-        st->pixels_per_line,
-        st->lines,
-        st->bytes_per_line);
-
+    if (tag_int((char *)resp, "JobId", &st->job_id) ||
+        tag_int((char *)resp, "PixelsPerLine", &st->pixels_per_line) ||
+        tag_int((char *)resp, "NumberOfLines", &st->lines) ||
+        tag_int((char *)resp, "BytesPerLine", &st->bytes_per_line)) {
+        free(resp);
+        return 1;
+    }
 
     fprintf(stderr,
             "[soapht-plugin] CreateScanJob OK "
@@ -994,26 +789,7 @@ static int fetch_jpeg(struct soap_session *ps, struct bb_state *st)
         "<DocumentDescription></DocumentDescription>"
         "</wscn:RetrieveImageRequest>", st->job_id);
 
-fprintf(stderr,
-        "[soapht-plugin] CreateScanJob inner built\n");
-fprintf(stderr,
-        "%s\n",
-        inner);
-
     char *xml = make_envelope(inner);
-
-char *request = make_envelope(inner);
-
-if (!request) {
-    fprintf(stderr,
-            "[soapht-plugin] FAIL: make_envelope CreateScanJob\n");
-    return 1;
-}
-
-fprintf(stderr,
-        "[soapht-plugin] CreateScanJob request ready\n");
-
-
     if (!xml) return 1;
     unsigned char *body = NULL;
     size_t body_len = 0;
@@ -1096,25 +872,10 @@ int bb_get_image_data(struct soap_session *ps, int max_length)
 __attribute__((visibility("default")))
 int bb_end_page(struct soap_session *ps, int io_error)
 {
+    (void)ps;
     (void)io_error;
-
-    if (!ps || !ps->bb_session)
-        return 0;
-
-    struct bb_state *st =
-        (struct bb_state *)ps->bb_session;
-
-    /*
-     * 현재 페이지 JPEG buffer만 정리한다.
-     *
-     * ADF batch에서는 JobId를 유지해야 다음 sane_start()에서
-     * 동일한 SOAPHT scan job으로 다음 장을 읽을 수 있다.
-     */
-    free_image(st);
-
-    ps->index = 0;
-    ps->cnt = 0;
-
+    /* Keep job alive until bb_end_scan(), matching the observed single
+     * CancelJob after image retrieval. */
     return 0;
 }
 
