@@ -65,18 +65,22 @@ cp "$SCRIPT_DIR/stubs/orblitei.h" scan/sane/orblitei.h
 cp "$SCRIPT_DIR/stubs/orblite.c"  scan/sane/orblite.c
 
 # Apply remaining diffs only if they haven't been applied already.
+# macOS /usr/bin/patch prompts on /dev/tty when a hunk looks reversed or
+# already applied. -N skips those hunks; -t never asks. Without both, a
+# redirected dry-run looks frozen (hidden "Assume -R?" prompt).
 for p in "$SCRIPT_DIR"/patches/01-darwin-headers.patch \
          "$SCRIPT_DIR"/patches/02-musb-macos.patch \
-         "$SCRIPT_DIR"/patches/03-hpaio-uninit-fix.patch; do
-    if patch -p1 --dry-run --silent < "$p" >/dev/null 2>&1; then
-        patch -p1 < "$p"
+         "$SCRIPT_DIR"/patches/03-hpaio-uninit-fix.patch \
+         "$SCRIPT_DIR"/patches/04-soapht-macos-plugin.patch; do
+    if patch -p1 -N -t --dry-run -s < "$p" >/dev/null 2>&1; then
+        patch -p1 -N -t < "$p"
     else
-        # already applied; skip
+        # already applied or not applicable; skip
         :
     fi
 done
 
-blue "==> configure"
+blue "==> configure (about a minute, please wait)"
 PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
 CFLAGS="-I$PREFIX/include -I$PREFIX/include/libusb-1.0 -I$PREFIX/include/sane -D_DARWIN_C_SOURCE -Wno-error -Wno-implicit-function-declaration -fcommon" \
 CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/libusb-1.0 -I$PREFIX/include/sane" \
@@ -95,32 +99,42 @@ LDFLAGS="-L$PREFIX/lib" \
     --disable-cups-drv-install \
     --disable-foomatic-drv-install \
     --disable-foomatic-ppd-install \
-    --disable-cups-ppd-install >/dev/null
+    --disable-cups-ppd-install
 
-# Patch the generated Makefile: drop libhpipp dependency (we don't build it),
-# and point hplip_confdir to our Homebrew prefix.
-sed -i.bak \
-    -e 's|^hplip_confdir = /etc/hp$|hplip_confdir = '"$PREFIX"'/etc/hp|' \
+blue "==> patching generated Makefile for macOS/Homebrew"
+
+# HPLIP runtime configuration must live under the Homebrew prefix.
+sed -i '' \
+    "s|^hplip_confdir = .*|hplip_confdir = $PREFIX/etc/hp|" \
     Makefile
 
-# Remove libhpipp.la from libsane_hpaio_la link deps (it's empty when network/IPP
-# is disabled, and `ar cr` errors on empty archives).
-python3 - <<PYEOF
-import re, pathlib
-mk = pathlib.Path('Makefile')
+# libhpipp is empty because network build is disabled.
+# macOS ar refuses to create an empty archive, so remove it from
+# libsane-hpaio dependencies/link inputs.
+python3 - <<'PYEOF'
+from pathlib import Path
+
+mk = Path("Makefile")
 src = mk.read_text()
-src = re.sub(r'(libsane_hpaio_la_DEPENDENCIES = libhpip\.la \\\n\tlibhpmud\.la \\\n)\tlibhpipp\.la \\\n', r'\1', src)
-src = re.sub(r'(libsane_hpaio_la_LIBADD = libhpip\.la \\\n\tlibhpmud\.la \\\n)\tlibhpipp\.la \\\n', r'\1', src)
+
+src = src.replace('\tlibhpipp.la \\\n', '')
+src = src.replace(' libhpipp.la', '')
+
 mk.write_text(src)
 PYEOF
 
-blue "==> make libsane-hpaio.la"
-make -k libhpmud.la libhpip.la libsane-hpaio.la 2>&1 | grep -E '(error:|Error)' | grep -v 'libhpipp' || true
+blue "==> building HPLIP scanner libraries"
+make libhpmud.la libhpip.la libsane-hpaio.la
 
-if [[ ! -f .libs/libsane-hpaio.1.so ]]; then
-    red "build failed — libsane-hpaio.1.so was not produced"
+
+shopt -s nullglob
+hpaio_mod=(.libs/libsane-hpaio.1.so .libs/libsane-hpaio.so .libs/libsane-hpaio.1.dylib .libs/libsane-hpaio.dylib)
+if [[ ! -e ${hpaio_mod[0]-} ]]; then
+    red "build failed — libsane-hpaio module was not produced"
+    ls -la .libs/libsane-hpaio* 2>/dev/null || true
     exit 1
 fi
+HPAIO_MOD="${hpaio_mod[0]}"
 
 blue "==> installing into $PREFIX"
 mkdir -p "$PREFIX/lib/sane" "$PREFIX/etc/sane.d" "$PREFIX/etc/hp" "$PREFIX/share/hplip/data/models/unreleased"
@@ -128,8 +142,12 @@ cp .libs/libhpmud.0.dylib    "$PREFIX/lib/"
 cp .libs/libhpip.0.dylib     "$PREFIX/lib/"
 ln -sf libhpmud.0.dylib "$PREFIX/lib/libhpmud.dylib"
 ln -sf libhpip.0.dylib  "$PREFIX/lib/libhpip.dylib"
-cp .libs/libsane-hpaio.1.so "$PREFIX/lib/sane/"
-ln -sf libsane-hpaio.1.so "$PREFIX/lib/sane/libsane-hpaio.so"
+cp "$HPAIO_MOD" "$PREFIX/lib/sane/$(basename "$HPAIO_MOD")"
+ln -sf "$(basename "$HPAIO_MOD")" "$PREFIX/lib/sane/libsane-hpaio.so"
+# SANE also probes the .1.so name on Darwin even when libtool emitted a dylib.
+if [[ "$(basename "$HPAIO_MOD")" != libsane-hpaio.1.so ]]; then
+    ln -sf "$(basename "$HPAIO_MOD")" "$PREFIX/lib/sane/libsane-hpaio.1.so"
+fi
 cp hplip.conf            "$PREFIX/etc/hp/"
 cp data/models/models.dat "$PREFIX/share/hplip/data/models/"
 [[ -f data/models/unreleased/unreleased.dat ]] && cp data/models/unreleased/unreleased.dat "$PREFIX/share/hplip/data/models/unreleased/" || \
@@ -140,6 +158,22 @@ DLL_CONF="$PREFIX/etc/sane.d/dll.conf"
 if [[ ! -f "$DLL_CONF" ]] || ! grep -q '^hpaio$' "$DLL_CONF"; then
     echo 'hpaio' >> "$DLL_CONF"
 fi
+
+# Build & install native macOS SOAPHT compatibility plugin.
+blue "==> building native macOS SOAPHT plugin"
+
+HPLIP_SRC="$WORK/hplip-${HPLIP_VER}" \
+  "$SCRIPT_DIR/soapht-macos/build-plugin.sh"
+
+blue "==> installing native macOS SOAPHT plugin"
+
+sudo mkdir -p "$PREFIX/share/hplip/scan/plugins"
+
+sudo install -m 0755 \
+  "$SCRIPT_DIR/soapht-macos/bb_soapht.so" \
+  "$PREFIX/share/hplip/scan/plugins/bb_soapht.so"
+
+green "==> SOAPHT plugin installed"
 
 # install hp-scan wrapper
 install -m 0755 "$SCRIPT_DIR/bin/hp-scan" "$PREFIX/bin/hp-scan"

@@ -1,0 +1,341 @@
+--- a/scan/sane/soapht.c
++++ b/scan/sane/soapht.c
+@@ -59,61 +59,130 @@
+ 
+ static int bb_load(struct soap_session *ps, const char *so)
+ {
+-   int stat=1;
++    int stat = 1;
+ 
+-   /* Load hpmud manually with symbols exported. Otherwise the plugin will not find it. */ 
+-   if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+-   {
+-	   if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+-           goto bugout;
+-   }
++    fprintf(stderr, "[soapht] bb_load entered so=%s\n", so);
+ 
+-   /* Load math library manually with symbols exported (Ubuntu 8.04). Otherwise the plugin will not find it. */ 
+-   if ((ps->math_handle = load_library("libm.so")) == NULL)
+-   {
+-      if ((ps->math_handle = load_library("libm.so.6")) == NULL)
+-         goto bugout;
+-   } 
++#ifdef __APPLE__
+ 
+-   if ((ps->bb_handle = load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
+-   {
+-      SendScanEvent(ps->uri, EVENT_PLUGIN_FAIL);
+-      goto bugout;
+-   } 
++    /*
++     * Our replacement bb_soapht.so resolves hpmud_* symbols dynamically.
++     * Make libhpmud globally visible before loading the plugin.
++     */
++    ps->hpmud_handle =
++        dlopen("/opt/homebrew/lib/libhpmud.0.dylib",
++               RTLD_NOW | RTLD_GLOBAL);
+ 
+-   if ((ps->bb_open = get_library_symbol(ps->bb_handle, "bb_open")) == NULL)
+-      goto bugout;
+- 
+-   if ((ps->bb_close = get_library_symbol(ps->bb_handle, "bb_close")) == NULL)
+-      goto bugout;
++    if (ps->hpmud_handle == NULL)
++    {
++        fprintf(stderr,
++                "[soapht] libhpmud dlopen FAILED: %s\n",
++                dlerror());
++        goto bugout;
++    }
+ 
+-   if ((ps->bb_get_parameters = get_library_symbol(ps->bb_handle, "bb_get_parameters")) == NULL)
+-      goto bugout;
++    fprintf(stderr,
++            "[soapht] libhpmud loaded handle=%p\n",
++            ps->hpmud_handle);
+ 
+-   if ((ps->bb_is_paper_in_adf = get_library_symbol(ps->bb_handle, "bb_is_paper_in_adf")) == NULL)
+-      goto bugout;
++    /*
++     * macOS has math functions in libSystem.
++     */
++    ps->math_handle = NULL;
+ 
+-   if ((ps->bb_start_scan = get_library_symbol(ps->bb_handle, "bb_start_scan")) == NULL)
+-      goto bugout;
++    /*
++     * Do not use HPLIP's proprietary-plugin loader on macOS.
++     * Load our native Mach-O replacement directly.
++     */
++    ps->bb_handle =
++        dlopen("/opt/homebrew/share/hplip/scan/plugins/bb_soapht.so",
++               RTLD_NOW | RTLD_GLOBAL);
+ 
+-   if ((ps->bb_end_scan = get_library_symbol(ps->bb_handle, "bb_end_scan")) == NULL)
+-      goto bugout;
++    if (ps->bb_handle == NULL)
++    {
++        fprintf(stderr,
++                "[soapht] bb_soapht.so dlopen FAILED: %s\n",
++                dlerror());
++        goto bugout;
++    }
+ 
+-   if ((ps->bb_get_image_data = get_library_symbol(ps->bb_handle, "bb_get_image_data")) == NULL)
+-      goto bugout;
++    fprintf(stderr,
++            "[soapht] bb_soapht.so loaded successfully handle=%p\n",
++            ps->bb_handle);
+ 
+-   if ((ps->bb_end_page = get_library_symbol(ps->bb_handle, "bb_end_page")) == NULL)
+-      goto bugout;
++#else
+ 
++    if ((ps->hpmud_handle =
++         load_library("libhpmud.so.0")) == NULL)
++    {
++        goto bugout;
++    }
+ 
+-   stat=0;
++    if ((ps->math_handle = load_library("libm.so")) == NULL)
++    {
++        if ((ps->math_handle =
++             load_library("libm.so.6")) == NULL)
++            goto bugout;
++    }
+ 
++    if ((ps->bb_handle =
++         load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
++    {
++        SendScanEvent(ps->uri, EVENT_PLUGIN_FAIL);
++        goto bugout;
++    }
++
++#endif
++
++#define LOAD_BB_SYMBOL(member, name)                            \
++    do {                                                        \
++        ps->member = get_library_symbol(ps->bb_handle, name);   \
++        if (ps->member == NULL)                                 \
++        {                                                       \
++            fprintf(stderr,                                     \
++                    "[soapht] missing symbol %s\n", name);      \
++            goto bugout;                                       \
++        }                                                       \
++        fprintf(stderr,                                         \
++                "[soapht] symbol %s=%p\n",                      \
++                name, (void *)ps->member);                      \
++    } while (0)
++
++    LOAD_BB_SYMBOL(bb_open, "bb_open");
++    LOAD_BB_SYMBOL(bb_close, "bb_close");
++    LOAD_BB_SYMBOL(bb_get_parameters, "bb_get_parameters");
++    LOAD_BB_SYMBOL(bb_is_paper_in_adf, "bb_is_paper_in_adf");
++    LOAD_BB_SYMBOL(bb_start_scan, "bb_start_scan");
++    LOAD_BB_SYMBOL(bb_end_scan, "bb_end_scan");
++    LOAD_BB_SYMBOL(bb_get_image_data, "bb_get_image_data");
++    LOAD_BB_SYMBOL(bb_end_page, "bb_end_page");
++
++#undef LOAD_BB_SYMBOL
++
++    stat = 0;
++
++    fprintf(stderr, "[soapht] bb_load OK\n");
++
+ bugout:
+-   return stat;
++    return stat;
+ } /* bb_load */
+ 
+ static int bb_unload(struct soap_session *ps)
+ {
++#ifdef __APPLE__
++
++    if (ps->bb_handle)
++        dlclose(ps->bb_handle);
++    ps->bb_handle = NULL;
++
++    if (ps->hpmud_handle)
++        dlclose(ps->hpmud_handle);
++    ps->hpmud_handle = NULL;
++
++    ps->math_handle = NULL;
++
++#else
++
+     unload_library(ps->bb_handle);
+     ps->bb_handle = NULL;
+ 
+@@ -123,9 +192,11 @@
+     unload_library(ps->math_handle);
+     ps->math_handle = NULL;
+ 
+-   return 0;
+-} /* bb_unload */
++#endif
+ 
++    return 0;
++}/* bb_unload */
++
+ /* Get raw data (ie: uncompressed data) from image processor. */
+ static int get_ip_data(struct soap_session *ps, SANE_Byte *data, SANE_Int maxLength, SANE_Int *length)
+ {
+@@ -143,6 +214,13 @@
+    if (ps->bb_get_image_data(ps, outputAvail))
+       goto bugout;
+ 
++fprintf(stderr,
++        "[soapht] get_ip_data: after bb_get_image_data "
++        "cnt=%d index=%d outputAvail=%u\n",
++        ps->cnt,
++        ps->index,
++        outputAvail);
++
+    if (ps->cnt > 0)
+    {
+       inputAvail = ps->cnt;
+@@ -157,6 +235,16 @@
+    /* Transform input data to output. Note, output buffer may consume more bytes than input buffer (ie: jpeg to raster). */
+    ip_ret = ipConvert(ps->ip_handle, inputAvail, input, &inputUsed, &inputNextPos, outputAvail, output, &outputUsed, &outputThisPos);
+ 
++fprintf(stderr,
++        "[soapht] ipConvert ret=0x%x "
++        "inputAvail=%u inputUsed=%u "
++        "outputAvail=%u outputUsed=%u\n",
++        ip_ret,
++        inputAvail,
++        inputUsed,
++        outputAvail,
++        outputUsed);
++
+    DBG6("cnt=%d index=%d input=%p inputAvail=%d inputUsed=%d inputNextPos=%d output=%p outputAvail=%d outputUsed=%d outputThisPos=%d\n", ps->cnt, ps->index, input, 
+          inputAvail, inputUsed, inputNextPos, output, outputAvail, outputUsed, outputThisPos);
+ 
+@@ -470,35 +558,80 @@
+    snprintf(session->uri, sizeof(session->uri)-1, "hp:%s", device);   /* prepend "hp:" */
+ 
+    /* Get actual model attributes from models.dat. */
+-   hpmud_query_model(session->uri, &ma);
+-   session->scan_type = ma.scantype;
++   fprintf(stderr,
++        "[soapht] query_model uri=%s\n",
++        session->uri);
+ 
+-   if (hpmud_open_device(session->uri, ma.mfp_mode, &session->dd) != HPMUD_R_OK)
+-   {
+-      BUG("unable to open device %s\n", session->uri);
+-      goto bugout;
++if (hpmud_query_model(session->uri, &ma) != HPMUD_R_OK)
++{
++    fprintf(stderr, "[soapht] query_model FAILED\n");
++    goto bugout;
++}
+ 
+-      free(session);
+-      session = NULL;
+-      return SANE_STATUS_IO_ERROR;
+-   }
++fprintf(stderr,
++        "[soapht] model OK scantype=%d mfp_mode=%d\n",
++        ma.scantype,
++        ma.mfp_mode);
+ 
+-   if (bb_load(session, SCAN_PLUGIN_SOAPHT))
+-   {
+-      stat = SANE_STATUS_IO_ERROR;
+-      goto bugout;
+-   }
++session->scan_type = ma.scantype;
+ 
+-   /* Init sane option descriptors. */
+-   init_options(session);  
++fprintf(stderr, "[soapht] before hpmud_open_device\n");
+ 
+-   if (session->bb_open(session))
+-   {
+-      stat = SANE_STATUS_IO_ERROR;
+-      goto bugout;
+-   }
++if (hpmud_open_device(session->uri,
++                      ma.mfp_mode,
++                      &session->dd) != HPMUD_R_OK)
++{
++    fprintf(stderr,
++            "[soapht] hpmud_open_device FAILED\n");
++    goto bugout;
++}
+ 
+-   /* Set supported Scan Modes as determined by bb_open. */
++fprintf(stderr,
++        "[soapht] hpmud_open_device OK dd=%d\n",
++        session->dd);
++
++fprintf(stderr, "[soapht] before bb_load\n");
++
++if (bb_load(session, SCAN_PLUGIN_SOAPHT))
++{
++    fprintf(stderr, "[soapht] bb_load FAILED\n");
++    stat = SANE_STATUS_IO_ERROR;
++    goto bugout;
++}
++
++fprintf(stderr, "[soapht] before bb_open\n");
++
++if (session->bb_open(session))
++{
++    fprintf(stderr, "[soapht] bb_open FAILED\n");
++    stat = SANE_STATUS_IO_ERROR;
++    goto bugout;
++}
++
++fprintf(stderr, "[soapht] bb_open OK\n");
++
++/*
++ * bb_open() has now populated the scanner capabilities.
++ * Build the SANE option descriptors from those capabilities.
++ */
++init_options(session);
++
++fprintf(stderr,
++        "[soapht] init_options OK mode=%s resolution=%s source=%s\n",
++        session->option[SOAP_OPTION_SCAN_MODE].name,
++        session->option[SOAP_OPTION_SCAN_RESOLUTION].name,
++        session->option[SOAP_OPTION_INPUT_SOURCE].name);
++
++/* Set supported Scan Modes as determined by bb_open. */
++soapht_control_option(
++    session,
++    SOAP_OPTION_SCAN_MODE,
++    SANE_ACTION_SET_AUTO,
++    NULL,
++    NULL
++);
++
++    /* Set supported Scan Modes as determined by bb_open. */
+    soapht_control_option(session, SOAP_OPTION_SCAN_MODE, SANE_ACTION_SET_AUTO, NULL, NULL); /* set default option */
+ 
+    /* Set scan input sources as determined by bb_open. */
+@@ -1122,12 +1255,16 @@
+   
+    ret = get_ip_data(ps, data, maxLength, length);
+ 
+-   if(ret & (IP_INPUT_ERROR | IP_FATAL_ERROR))
+-   {
+-      BUG("ipConvert error=%x\n", ret);
+-      goto bugout;
+-   }
++if(ret & (IP_INPUT_ERROR | IP_FATAL_ERROR))
++{
++    fprintf(stderr,
++            "[soapht] READ ERROR ret=0x%x cnt=%d index=%d\n",
++            ret, ps->cnt, ps->index);
+ 
++    BUG("ipConvert error=%x\n", ret);
++    goto bugout;
++}
++
+    if (ret & IP_DONE)
+    {
+       stat = SANE_STATUS_EOF;
