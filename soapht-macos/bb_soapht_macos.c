@@ -13,7 +13,7 @@
  * This implementation was derived from observable wire behavior and
  * public HPLIP interfaces; it does not contain HP proprietary plugin code.
  */
-
+#include <unistd.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
@@ -514,21 +514,23 @@ int bb_get_parameters(struct soap_session *ps, SANE_Parameters *pp,
     return 0;
 }
 
-__attribute__((visibility("default")))
-int bb_is_paper_in_adf(struct soap_session *ps)
+static int query_paper_in_adf(struct soap_session *ps)
 {
-    if (!ps)
-        return -1;
-
     char *xml = make_envelope(
         "<wscn:GetScannerElements></wscn:GetScannerElements>");
+
     if (!xml)
         return -1;
 
     unsigned char *resp = NULL;
     size_t resp_len = 0;
+
     int rc = soap_transaction(
-        ps, xml, &resp, &resp_len, SOAPHT_TIMEOUT);
+        ps,
+        xml,
+        &resp,
+        &resp_len,
+        SOAPHT_TIMEOUT);
 
     free(xml);
 
@@ -538,16 +540,20 @@ int bb_is_paper_in_adf(struct soap_session *ps)
     }
 
     int result = -1;
-    const char *paper = strstr((char *)resp, "PaperInADF");
-    if (paper) {
-        const char *value = strchr(paper, '>');
-        if (value) {
-            value++;
-            if (strncmp(value, "true", 4) == 0 ||
-                strncmp(value, "1", 1) == 0) {
+
+    const char *p = strstr((char *)resp, "PaperInADF");
+
+    if (p) {
+        const char *gt = strchr(p, '>');
+
+        if (gt) {
+            ++gt;
+
+            if (strncmp(gt, "true", 4) == 0 ||
+                strncmp(gt, "1", 1) == 0) {
                 result = 1;
-            } else if (strncmp(value, "false", 5) == 0 ||
-                       strncmp(value, "0", 1) == 0) {
+            } else if (strncmp(gt, "false", 5) == 0 ||
+                       strncmp(gt, "0", 1) == 0) {
                 result = 0;
             }
         }
@@ -556,6 +562,44 @@ int bb_is_paper_in_adf(struct soap_session *ps)
     free(resp);
     return result;
 }
+
+__attribute__((visibility("default")))
+int bb_is_paper_in_adf(struct soap_session *ps)
+{
+    if (!ps || !ps->bb_session)
+        return -1;
+
+    struct bb_state *st =
+        (struct bb_state *)ps->bb_session;
+
+    /*
+     * First page:
+     * no active scan job yet, so read the feeder sensor immediately.
+     */
+    if (!st->job_active)
+        return query_paper_in_adf(ps);
+
+    /*
+     * Between ADF pages the M127fn may briefly continue to report
+     * PaperInADF=true after the last sheet has already been ejected.
+     *
+     * Poll for a short settling period.  If the sensor becomes false
+     * at any point, the batch is finished.  If it remains true for the
+     * entire interval, another page is really present.
+     */
+    for (int i = 0; i < 6; i++) {
+        int result = query_paper_in_adf(ps);
+
+        if (result <= 0)
+            return result;
+
+        if (i < 5)
+            usleep(250000);
+    }
+
+    return 1;
+}
+
 
 __attribute__((visibility("default")))
 int bb_start_scan(struct soap_session *ps)
@@ -577,16 +621,28 @@ int bb_start_scan(struct soap_session *ps)
      * The M127fn supports simplex ADF only. Keep the same SOAPHT JobId
      * across ADF pages; each subsequent RetrieveImage returns the next page.
      */
-    free_image(st);
-    st->pixels_per_line = 0;
-    st->lines = 0;
-    st->bytes_per_line = 0;
+/*
+ * Previous page JPEG data is no longer needed.
+ */
+free_image(st);
 
-    if (is_adf && st->job_active && st->job_id > 0)
-        return 0;
+/*
+ * An ADF batch uses one SOAPHT job for all pages.
+ *
+ * Keep the image geometry returned by CreateScanJob because the next
+ * page uses the same scan ticket and therefore the same raster geometry.
+ */
+if (is_adf && st->job_active && st->job_id > 0)
+    return 0;
 
-    st->job_id = 0;
-    st->job_active = 0;
+/*
+ * Starting a completely new scan job.
+ */
+st->job_id = 0;
+st->job_active = 0;
+st->pixels_per_line = 0;
+st->lines = 0;
+st->bytes_per_line = 0;
 
     if (ps->currentCompression != SF_JFIF)
         ps->currentCompression = SF_JFIF;
