@@ -1,8 +1,8 @@
 /*
  * bb_soapht_macos.c - clean-room SOAPHT compatibility plugin for
- * HP LaserJet Pro MFP M127fn on macOS.
+ * HP scan-type=5 devices on macOS (hardware baseline: M127fn).
  *
- * Current scope (v0.3):
+ * Current scope (v0.4 + compatibility work):
  *   - USB/HPMUD channel: HP-SOAP-SCAN
  *   - Flatbed: Gray/Color, 150/300/600 dpi
  *   - ADF simplex: Gray/Color, 150/300 dpi
@@ -16,10 +16,13 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "sane.h"
 #include "saneopts.h"
@@ -30,23 +33,18 @@
 #define SOAPHT_CHANNEL "HP-SOAP-SCAN"
 #define SOAPHT_TIMEOUT 45
 #define SOAPHT_IMAGE_TIMEOUT 300
+#define SOAPHT_CANCEL_TIMEOUT 5
+#define SOAPHT_READ_POLL_TIMEOUT 1
 #define SOAPHT_MAX_RESPONSE (16u * 1024u * 1024u)
 
-/* M127fn values observed from GetScannerElements. */
-#define M127_PLATEN_WIDTH_THOU   8500
-#define M127_PLATEN_HEIGHT_THOU 11690
-#define M127_MIN_WIDTH_THOU      1920
-#define M127_MIN_HEIGHT_THOU     1920
-
-#define M127_ADF_WIDTH_THOU       8500
-#define M127_ADF_HEIGHT_THOU     14000
-#define M127_ADF_MIN_WIDTH_THOU   1920
-#define M127_ADF_MIN_HEIGHT_THOU  1920
-
+#include "soapht_capabilities.h"
 
 struct bb_state {
+    struct scanner_caps caps;
     int job_id;
     int job_active;
+    int cancel_pending;
+    int job_is_adf;
     unsigned char *jpeg;
     size_t jpeg_size;
     size_t jpeg_off;
@@ -68,24 +66,72 @@ static const char *xml_prefix =
 static const char *xml_suffix =
     "</SOAP-ENV:Body></SOAP-ENV:Envelope>";
 
-static int write_all(HPMUD_DEVICE dd, HPMUD_CHANNEL cd,
-                     const void *buf, int len, int timeout)
+static void debug_log(const char *format, ...)
+{
+    const char *level = getenv("SANE_DEBUG_HPAIO");
+    if (!level || atoi(level) < 6) return;
+    va_list args;
+    va_start(args, format);
+    fputs("[bb_soapht] ", stderr);
+    vfprintf(stderr, format, args);
+    fputc('\n', stderr);
+    va_end(args);
+}
+
+/* The ABI still uses zero for success. Native failures use SANE_Status;
+ * soapht.c maps these without changing struct soap_session or Linux plugins. */
+static int transport_status(enum HPMUD_RESULT result)
+{
+    return result == HPMUD_R_DEVICE_BUSY ? SANE_STATUS_DEVICE_BUSY :
+           SANE_STATUS_IO_ERROR;
+}
+
+static double monotonic_seconds(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+}
+
+/* HPMUD timeouts are integer seconds, so allow at most one second rounding. */
+static int remaining_timeout(struct soap_session *ps, double deadline,
+                             int limit, int cancelling)
+{
+    if (!cancelling && ps->user_cancel)
+        return -SANE_STATUS_CANCELLED;
+    double now = monotonic_seconds();
+    double remaining = deadline - now;
+    if (now == 0 || remaining <= 0)
+        return -SANE_STATUS_IO_ERROR;
+    if (remaining >= limit)
+        return limit;
+    int seconds = (int)remaining;
+    return seconds + (remaining > seconds);
+}
+
+static int write_all(struct soap_session *ps, HPMUD_CHANNEL cd,
+                     const void *buf, int len, int timeout,
+                     double deadline, int cancelling)
 {
     const unsigned char *p = (const unsigned char *)buf;
     int off = 0;
     while (off < len) {
+        int wait = remaining_timeout(ps, deadline, timeout, cancelling);
+        if (wait < 0) return -wait;
         int wrote = 0;
-        enum HPMUD_RESULT r = hpmud_write_channel(dd, cd, p + off,
-                                                   len - off, timeout, &wrote);
-        if (r != HPMUD_R_OK || wrote <= 0)
-            return 1;
+        enum HPMUD_RESULT r = hpmud_write_channel(ps->dd, cd, p + off,
+                                                 len - off, wait, &wrote);
+        if (!cancelling && ps->user_cancel) return SANE_STATUS_CANCELLED;
+        if (r != HPMUD_R_OK) return transport_status(r);
+        if (wrote <= 0 || wrote > len - off) return SANE_STATUS_IO_ERROR;
         off += wrote;
     }
-    return 0;
+    return SANE_STATUS_GOOD;
 }
 
 /* Parse an HTTP/1.1 chunked body.
- * return: 1 complete, 0 incomplete, -1 malformed.
+ * return: 1 complete, 0 incomplete, -1 malformed, -2 allocation failure.
  */
 static int dechunk_try(const unsigned char *src, size_t src_len,
                        unsigned char **out, size_t *out_len)
@@ -114,8 +160,11 @@ static int dechunk_try(const unsigned char *src, size_t src_len,
         char *semi = strchr(hex, ';');
         if (semi) *semi = 0;
         char *endp = NULL;
+        errno = 0;
         unsigned long chunk = strtoul(hex, &endp, 16);
-        if (endp == hex) {
+        if (!isxdigit((unsigned char)hex[0]) || endp == hex ||
+            *endp != '\0' || errno == ERANGE ||
+            chunk > SOAPHT_MAX_RESPONSE) {
             free(dst);
             return -1;
         }
@@ -131,12 +180,16 @@ static int dechunk_try(const unsigned char *src, size_t src_len,
                 free(dst);
                 return -1;
             }
+            if (!dst) {
+                dst = calloc(1, 1);
+                if (!dst) return -2;
+            }
             *out = dst;
             *out_len = total;
             return 1;
         }
 
-        if (chunk > SOAPHT_MAX_RESPONSE || p + chunk + 2 > src_len) {
+        if (p + chunk + 2 > src_len) {
             free(dst);
             return 0;
         }
@@ -152,7 +205,7 @@ static int dechunk_try(const unsigned char *src, size_t src_len,
         unsigned char *tmp = realloc(dst, total + chunk + 1);
         if (!tmp) {
             free(dst);
-            return -1;
+            return -2;
         }
         dst = tmp;
         memcpy(dst + total, src + p, chunk);
@@ -162,40 +215,40 @@ static int dechunk_try(const unsigned char *src, size_t src_len,
     }
 }
 
-static int read_http_response(HPMUD_DEVICE dd, HPMUD_CHANNEL cd,
+static int read_http_response(struct soap_session *ps, HPMUD_CHANNEL cd,
                               unsigned char **body, size_t *body_len,
-                              int timeout)
+                              double deadline)
 {
     unsigned char *raw = NULL;
-    size_t raw_len = 0, raw_cap = 0;
-    size_t hdr_end = 0;
+    size_t raw_len = 0, raw_cap = 0, hdr_end = 0;
+    int status = SANE_STATUS_IO_ERROR;
+    int http_status = 0;
 
     for (;;) {
         unsigned char tmp[4096];
         int got = 0;
-        enum HPMUD_RESULT r = hpmud_read_channel(dd, cd, tmp, sizeof(tmp),
-                                                  timeout, &got);
-        if (r != HPMUD_R_OK || got < 0) {
-            free(raw);
-            return 1;
+        /* Once a request has been sent, drain its response to the HTTP
+         * boundary. Closing mid-DIME leaves M127 data for the next request.
+         * Cancellation is returned after draining, under the same deadline. */
+        int wait = remaining_timeout(ps, deadline, SOAPHT_READ_POLL_TIMEOUT, 1);
+        if (wait < 0) { status = -wait; break; }
+        enum HPMUD_RESULT r = hpmud_read_channel(ps->dd, cd, tmp, sizeof(tmp), wait, &got);
+        if (r != HPMUD_R_OK && r != HPMUD_R_IO_TIMEOUT) {
+            debug_log("read failed: HPMUD=%d", r);
+            status = transport_status(r);
+            break;
         }
-        if (got == 0) {
-            free(raw);
-            return 1;
-        }
-
-        if (raw_len + (size_t)got > SOAPHT_MAX_RESPONSE) {
-            free(raw);
-            return 1;
-        }
+        if (got < 0 || (size_t)got > sizeof(tmp) ||
+            raw_len + (size_t)got > SOAPHT_MAX_RESPONSE)
+            break;
+        /* Continue the same response, retaining partial data. No SOAP request
+         * is replayed. The absolute deadline bounds repeated empty polls. */
+        if (got == 0) continue;
         if (raw_len + (size_t)got + 1 > raw_cap) {
             size_t nc = raw_cap ? raw_cap * 2 : 8192;
             while (nc < raw_len + (size_t)got + 1) nc *= 2;
             unsigned char *nr = realloc(raw, nc);
-            if (!nr) {
-                free(raw);
-                return 1;
-            }
+            if (!nr) { status = SANE_STATUS_NO_MEM; break; }
             raw = nr;
             raw_cap = nc;
         }
@@ -205,50 +258,70 @@ static int read_http_response(HPMUD_DEVICE dd, HPMUD_CHANNEL cd,
 
         if (!hdr_end) {
             for (size_t i = 0; i + 3 < raw_len; i++) {
-                if (raw[i] == '\r' && raw[i+1] == '\n' &&
-                    raw[i+2] == '\r' && raw[i+3] == '\n') {
+                if (memcmp(raw + i, "\r\n\r\n", 4) == 0) {
                     hdr_end = i + 4;
                     break;
                 }
             }
-            if (!hdr_end)
-                continue;
-            if (raw_len < 12 || memcmp(raw, "HTTP/1.1 2", 10) != 0) {
-                free(raw);
-                return 1;
-            }
+            if (!hdr_end) continue;
+            if (hdr_end < 16 || memcmp(raw, "HTTP/1.1 ", 9) != 0 ||
+                !isdigit(raw[9]) || !isdigit(raw[10]) || !isdigit(raw[11]) ||
+                raw[12] != ' ')
+                break;
+            http_status = (raw[9] - '0') * 100 + (raw[10] - '0') * 10 + raw[11] - '0';
+            debug_log("HTTP status=%d", http_status);
+            /* Error responses have a body too. Closing at a 400/409/503
+             * header leaves its chunks ahead of the next CancelJob/status
+             * response on M127 USB. Drain the same HTTP response first. */
+            if (http_status < 200 || http_status >= 300)
+                debug_log("HTTP error headers: %.*s", (int)hdr_end, raw);
         }
 
         unsigned char *decoded = NULL;
         size_t decoded_len = 0;
-        int st = dechunk_try(raw + hdr_end, raw_len - hdr_end,
-                             &decoded, &decoded_len);
-        if (st == 1) {
-            free(raw);
-            *body = decoded;
-            *body_len = decoded_len;
-            return 0;
+        int complete = dechunk_try(raw + hdr_end, raw_len - hdr_end, &decoded, &decoded_len);
+        if (complete < 0) {
+            if (complete == -2) status = SANE_STATUS_NO_MEM;
+            break;
         }
-        if (st < 0) {
-            free(raw);
-            return 1;
+        if (!complete) continue;
+        const char *xml = (const char *)decoded;
+        int fault = strstr(xml, ":Fault") != NULL || strstr(xml, "<Fault") != NULL;
+        if (fault || http_status < 200 || http_status >= 300) {
+            debug_log("SOAP fault: %.1024s", xml);
+            if (http_status == 409 || http_status == 503 ||
+                (fault && (strstr(xml, "ScannerBusy") ||
+                          strstr(xml, "ServerErrorNotAcceptingJobs") ||
+                          /* M127fn HTTP 500 fault observed between scan jobs. */
+                          strstr(xml, "The service is temporarily blocked and can't accept new scan job requests."))))
+                status = SANE_STATUS_DEVICE_BUSY;
+            free(decoded);
+            break;
         }
+        *body = decoded;
+        *body_len = decoded_len;
+        status = SANE_STATUS_GOOD;
+        break;
     }
+    free(raw);
+    return status;
 }
 
-static int soap_transaction(struct soap_session *ps,
-                            const char *xml,
-                            unsigned char **body,
-                            size_t *body_len,
-                            int timeout)
+static int soap_transaction_mode(struct soap_session *ps, const char *xml,
+                                 unsigned char **body, size_t *body_len,
+                                 int timeout, int cancelling)
 {
     HPMUD_CHANNEL cd = -1;
-    char header[256];
-    char chunk_head[32];
+    char header[256], chunk_head[32];
     int xml_len = (int)strlen(xml);
-
-    if (hpmud_open_channel(ps->dd, SOAPHT_CHANNEL, &cd) != HPMUD_R_OK)
-        return 1;
+    *body = NULL;
+    *body_len = 0;
+    double now = monotonic_seconds();
+    if (now == 0) return SANE_STATUS_IO_ERROR;
+    double deadline = now + timeout;
+    if (!cancelling && ps->user_cancel) return SANE_STATUS_CANCELLED;
+    enum HPMUD_RESULT r = hpmud_open_channel(ps->dd, SOAPHT_CHANNEL, &cd);
+    if (r != HPMUD_R_OK) return transport_status(r);
 
     int hn = snprintf(header, sizeof(header),
         "POST / HTTP/1.1\r\n"
@@ -257,19 +330,36 @@ static int soap_transaction(struct soap_session *ps,
         "Content-Type: application/soap+xml; charset=utf-8\r\n"
         "Transfer-Encoding: chunked\r\n"
         "Connection: close\r\n\r\n");
-
     int cn = snprintf(chunk_head, sizeof(chunk_head), "%x\r\n", xml_len);
-    int fail = 0;
-    fail |= write_all(ps->dd, cd, header, hn, SOAPHT_TIMEOUT);
-    fail |= write_all(ps->dd, cd, chunk_head, cn, 1);
-    fail |= write_all(ps->dd, cd, xml, xml_len, 1);
-    fail |= write_all(ps->dd, cd, "\r\n0\r\n\r\n", 7, 1);
+    /* Never abandon a partially written SOAP request merely because a signal
+     * arrived. Complete this transaction, then cancel the known job. */
+    int status = !cancelling && ps->user_cancel ? SANE_STATUS_CANCELLED : SANE_STATUS_GOOD;
+    if (!status) status = write_all(ps, cd, header, hn, SOAPHT_TIMEOUT, deadline, 1);
+    if (!status) status = write_all(ps, cd, chunk_head, cn, 1, deadline, 1);
+    if (!status) status = write_all(ps, cd, xml, xml_len, 1, deadline, 1);
+    if (!status) status = write_all(ps, cd, "\r\n0\r\n\r\n", 7, 1, deadline, 1);
+    if (!status) status = read_http_response(ps, cd, body, body_len, deadline);
+    r = hpmud_close_channel(ps->dd, cd);
+    if (!status && r != HPMUD_R_OK) status = transport_status(r);
+    /* Preserve CreateScanJob's reply long enough to learn/cancel its JobId. */
+    if (!status && !cancelling && ps->user_cancel && !strstr(xml, "CreateScanJobRequest"))
+        status = SANE_STATUS_CANCELLED;
+    if (status) {
+        debug_log("transaction failed: status=%d, request=%s", status,
+                  strstr(xml, "CreateScanJobRequest") ? "CreateScanJob" :
+                  strstr(xml, "RetrieveImageRequest") ? "RetrieveImage" :
+                  cancelling ? "CancelJob" : "GetScannerElements");
+        free(*body);
+        *body = NULL;
+        *body_len = 0;
+    }
+    return status;
+}
 
-    if (!fail)
-        fail = read_http_response(ps->dd, cd, body, body_len, timeout);
-
-    hpmud_close_channel(ps->dd, cd);
-    return fail;
+static int soap_transaction(struct soap_session *ps, const char *xml,
+                            unsigned char **body, size_t *body_len, int timeout)
+{
+    return soap_transaction_mode(ps, xml, body, body_len, timeout, 0);
 }
 
 static char *make_envelope(const char *inner)
@@ -279,25 +369,6 @@ static char *make_envelope(const char *inner)
     if (!s) return NULL;
     snprintf(s, n, "%s%s%s", xml_prefix, inner, xml_suffix);
     return s;
-}
-
-static int tag_int(const char *xml, const char *tag, int *value)
-{
-    char open[96], close[96];
-    snprintf(open, sizeof(open), "<%s>", tag);
-    snprintf(close, sizeof(close), "</%s>", tag);
-    const char *a = strstr(xml, open);
-    if (!a) return 1;
-    a += strlen(open);
-    const char *b = strstr(a, close);
-    if (!b) return 1;
-    char tmp[32];
-    size_t n = (size_t)(b - a);
-    if (n == 0 || n >= sizeof(tmp)) return 1;
-    memcpy(tmp, a, n);
-    tmp[n] = 0;
-    *value = atoi(tmp);
-    return 0;
 }
 
 static SANE_Fixed thou_to_mm_fixed(int thou)
@@ -326,117 +397,102 @@ static int mm_fixed_to_thou(SANE_Fixed value)
     return (int)(thou + 0.5);
 }
 
-static void setup_capabilities(struct soap_session *ps)
+static void source_ranges(const struct source_caps *caps, SANE_Range *x, SANE_Range *y)
 {
+    *x = (SANE_Range){0, thou_to_mm_fixed(caps->max_width), 0};
+    *y = (SANE_Range){0, thou_to_mm_fixed(caps->max_height), 0};
+}
+
+static void setup_capabilities(struct soap_session *ps, const struct scanner_caps *caps)
+{
+    const struct source_caps *first = caps->platen.present ? &caps->platen : &caps->adf;
+    int gray = first->gray, color = first->color, n = 0;
+    if (caps->platen.present && caps->adf.present) {
+        gray &= caps->adf.gray;
+        color &= caps->adf.color;
+    }
     memset(ps->scanModeList, 0, sizeof(ps->scanModeList));
     memset(ps->scanModeMap, 0, sizeof(ps->scanModeMap));
-    ps->scanModeList[0] = SANE_VALUE_SCAN_MODE_GRAY;
-    ps->scanModeMap[0] = CE_GRAY8;
-    ps->scanModeList[1] = SANE_VALUE_SCAN_MODE_COLOR;
-    ps->scanModeMap[1] = CE_RGB24;
-
+    if (gray) { ps->scanModeList[n] = SANE_VALUE_SCAN_MODE_GRAY; ps->scanModeMap[n++] = CE_GRAY8; }
+    if (color) { ps->scanModeList[n] = SANE_VALUE_SCAN_MODE_COLOR; ps->scanModeMap[n++] = CE_RGB24; }
     memset(ps->inputSourceList, 0, sizeof(ps->inputSourceList));
     memset(ps->inputSourceMap, 0, sizeof(ps->inputSourceMap));
-    ps->inputSourceList[0] = "Flatbed";
-    ps->inputSourceMap[0] = IS_PLATEN;
-    ps->inputSourceList[1] = "ADF";
-    ps->inputSourceMap[1] = IS_ADF;
-
-    memset(ps->resolutionList, 0, sizeof(ps->resolutionList));
-    memset(ps->platen_resolutionList, 0, sizeof(ps->platen_resolutionList));
-    ps->resolutionList[0] = 3;
-    ps->resolutionList[1] = 150;
-    ps->resolutionList[2] = 300;
-    ps->resolutionList[3] = 600;
-    ps->platen_resolutionList[0] = 3;
-    ps->platen_resolutionList[1] = 150;
-    ps->platen_resolutionList[2] = 300;
-    ps->platen_resolutionList[3] = 600;
-
-    ps->platen_min_width = thou_to_mm_fixed(M127_MIN_WIDTH_THOU);
-    ps->platen_min_height = thou_to_mm_fixed(M127_MIN_HEIGHT_THOU);
-
-    SANE_Fixed platen_max_width =
-        thou_to_mm_fixed(M127_PLATEN_WIDTH_THOU);
-    SANE_Fixed platen_max_height =
-        thou_to_mm_fixed(M127_PLATEN_HEIGHT_THOU);
-
-    ps->platen_tlxRange.min = 0;
-    ps->platen_tlxRange.max = platen_max_width;
-    ps->platen_tlxRange.quant = 0;
+    n = 0;
+    if (caps->platen.present) { ps->inputSourceList[n] = "Flatbed"; ps->inputSourceMap[n++] = IS_PLATEN; }
+    if (caps->adf.present) { ps->inputSourceList[n] = "ADF"; ps->inputSourceMap[n++] = IS_ADF; }
+    /* Duplex capability is recorded but not advertised until implemented. */
+    memcpy(ps->platen_resolutionList, caps->platen.resolutions, sizeof(ps->platen_resolutionList));
+    memcpy(ps->adf_resolutionList, caps->adf.resolutions, sizeof(ps->adf_resolutionList));
+    memcpy(ps->resolutionList, first->resolutions, sizeof(ps->resolutionList));
+    ps->platen_min_width = thou_to_mm_fixed(caps->platen.min_width);
+    ps->platen_min_height = thou_to_mm_fixed(caps->platen.min_height);
+    ps->adf_min_width = thou_to_mm_fixed(caps->adf.min_width);
+    ps->adf_min_height = thou_to_mm_fixed(caps->adf.min_height);
+    source_ranges(&caps->platen, &ps->platen_tlxRange, &ps->platen_tlyRange);
     ps->platen_brxRange = ps->platen_tlxRange;
-
-    ps->platen_tlyRange.min = 0;
-    ps->platen_tlyRange.max = platen_max_height;
-    ps->platen_tlyRange.quant = 0;
     ps->platen_bryRange = ps->platen_tlyRange;
-
-    memset(&ps->adf_tlxRange, 0, sizeof(ps->adf_tlxRange));
-    memset(&ps->adf_tlyRange, 0, sizeof(ps->adf_tlyRange));
-    memset(&ps->adf_brxRange, 0, sizeof(ps->adf_brxRange));
-    memset(&ps->adf_bryRange, 0, sizeof(ps->adf_bryRange));
-    memset(ps->adf_resolutionList, 0, sizeof(ps->adf_resolutionList));
-
-    ps->adf_resolutionList[0] = 2;
-    ps->adf_resolutionList[1] = 150;
-    ps->adf_resolutionList[2] = 300;
-
-    ps->adf_min_width = thou_to_mm_fixed(M127_ADF_MIN_WIDTH_THOU);
-    ps->adf_min_height = thou_to_mm_fixed(M127_ADF_MIN_HEIGHT_THOU);
-
-    SANE_Fixed adf_max_width =
-        thou_to_mm_fixed(M127_ADF_WIDTH_THOU);
-    SANE_Fixed adf_max_height =
-        thou_to_mm_fixed(M127_ADF_HEIGHT_THOU);
-
-    ps->adf_tlxRange.min = 0;
-    ps->adf_tlxRange.max = adf_max_width;
-    ps->adf_tlxRange.quant = 0;
+    source_ranges(&caps->adf, &ps->adf_tlxRange, &ps->adf_tlyRange);
     ps->adf_brxRange = ps->adf_tlxRange;
-
-    ps->adf_tlyRange.min = 0;
-    ps->adf_tlyRange.max = adf_max_height;
-    ps->adf_tlyRange.quant = 0;
     ps->adf_bryRange = ps->adf_tlyRange;
-
-    ps->jpegQualityRange.min = 0;
-    ps->jpegQualityRange.max = 100;
-    ps->jpegQualityRange.quant = 0;
+    ps->jpegQualityRange = (SANE_Range){0, 100, 0};
 }
+
+static const struct source_caps *selected_caps(struct soap_session *ps)
+{
+    struct bb_state *st = ps->bb_session;
+    if (!st) return NULL;
+    if (ps->currentInputSource == IS_PLATEN && st->caps.platen.present) return &st->caps.platen;
+    if (ps->currentInputSource == IS_ADF && st->caps.adf.present) return &st->caps.adf;
+    return NULL;
+}
+
+static int source_dpi(const struct source_caps *caps, int dpi)
+{
+    for (int i = 1; i <= caps->resolutions[0]; i++)
+        if (caps->resolutions[i] == dpi) return dpi;
+    for (int i = 1; i <= caps->resolutions[0]; i++)
+        if (caps->resolutions[i] == 300) return 300;
+    return caps->resolutions[1];
+}
+
+static int cancel_job(struct soap_session *ps, struct bb_state *st);
+int bb_end_scan(struct soap_session *ps, int io_error);
 
 __attribute__((visibility("default")))
 int bb_open(struct soap_session *ps)
 {
-    if (!ps) return 1;
+    if (!ps || ps->bb_session) return SANE_STATUS_IO_ERROR;
     struct bb_state *st = calloc(1, sizeof(*st));
-    if (!st) return 1;
+    if (!st) return SANE_STATUS_NO_MEM;
     ps->bb_session = st;
 
     /* Probe the real scanner once, matching the proprietary plugin's flow. */
     char *xml = make_envelope(
         "<wscn:GetScannerElements></wscn:GetScannerElements>");
-    if (!xml) return 1;
+    if (!xml) {
+        free(st);
+        ps->bb_session = NULL;
+        return SANE_STATUS_NO_MEM;
+    }
     unsigned char *resp = NULL;
     size_t resp_len = 0;
     int rc = soap_transaction(ps, xml, &resp, &resp_len, SOAPHT_TIMEOUT);
     free(xml);
     if (rc) {
-        free(st);
-        ps->bb_session = NULL;
-        return 1;
-    }
-
-    /* Minimal sanity check: this is the SOAPHT scanner we expect. */
-    if (!strstr((char *)resp, "<ScannerConfiguration>") ||
-        !strstr((char *)resp, "<FlatbedSupported>true</FlatbedSupported>")) {
         free(resp);
         free(st);
         ps->bb_session = NULL;
-        return 1;
+        return rc;
     }
-    free(resp);
 
-    setup_capabilities(ps);
+    rc = parse_capabilities((char *)resp, resp_len, &st->caps);
+    free(resp);
+    if (rc) {
+        free(st);
+        ps->bb_session = NULL;
+        return rc;
+    }
+    setup_capabilities(ps, &st->caps);
     return 0;
 }
 
@@ -446,6 +502,7 @@ int bb_close(struct soap_session *ps)
     if (!ps) return 0;
     struct bb_state *st = (struct bb_state *)ps->bb_session;
     if (st) {
+        bb_end_scan(ps, 0);
         free_image(st);
         free(st);
     }
@@ -458,7 +515,7 @@ int bb_get_parameters(struct soap_session *ps, SANE_Parameters *pp,
                       int scan_started)
 {
     (void)scan_started;
-    if (!ps || !pp) return 1;
+    if (!ps || !pp) return SANE_STATUS_IO_ERROR;
 
     struct bb_state *st = (struct bb_state *)ps->bb_session;
 
@@ -467,8 +524,9 @@ int bb_get_parameters(struct soap_session *ps, SANE_Parameters *pp,
     const int is_rgb = (ps->currentScanMode == CE_RGB24);
     int dpi = ps->currentResolution;
 
-    if (dpi != 150 && dpi != 300 && dpi != 600)
-        dpi = 300;
+    const struct source_caps *caps = selected_caps(ps);
+    if (!caps) return SANE_STATUS_INVAL;
+    dpi = source_dpi(caps, dpi);
 
     pp->format = is_rgb ? SANE_FRAME_RGB : SANE_FRAME_GRAY;
     pp->last_frame = SANE_TRUE;
@@ -498,15 +556,16 @@ int bb_get_parameters(struct soap_session *ps, SANE_Parameters *pp,
         pp->bytes_per_line =
             st->pixels_per_line * (is_rgb ? 3 : 1);
     } else {
-        /*
-         * Best guess before the job starts.
-         * Width/height are thousandths of an inch and the M127fn truncates
-         * to integer pixels.
-         */
-        pp->pixels_per_line =
-            (8499 * dpi) / 1000;
-        pp->lines =
-            (11689 * dpi) / 1000;
+        int width = mm_fixed_to_thou(ps->effectiveBrx - ps->effectiveTlx);
+        int height = mm_fixed_to_thou(ps->effectiveBry - ps->effectiveTly);
+        int left = mm_fixed_to_thou(ps->effectiveTlx), top = mm_fixed_to_thou(ps->effectiveTly);
+        if (left >= caps->max_width || top >= caps->max_height) return SANE_STATUS_INVAL;
+        if (width <= 0) width = caps->max_width;
+        if (height <= 0) height = ps->currentInputSource == IS_ADF && caps->max_height > 11689 ? 11689 : caps->max_height;
+        if (width > caps->max_width - left) width = caps->max_width - left;
+        if (height > caps->max_height - top) height = caps->max_height - top;
+        pp->pixels_per_line = (width * dpi) / 1000;
+        pp->lines = (height * dpi) / 1000;
         pp->bytes_per_line =
             pp->pixels_per_line * (is_rgb ? 3 : 1);
     }
@@ -520,7 +579,7 @@ static int query_paper_in_adf(struct soap_session *ps)
         "<wscn:GetScannerElements></wscn:GetScannerElements>");
 
     if (!xml)
-        return -1;
+        return -SANE_STATUS_NO_MEM;
 
     unsigned char *resp = NULL;
     size_t resp_len = 0;
@@ -536,28 +595,17 @@ static int query_paper_in_adf(struct soap_session *ps)
 
     if (rc || !resp) {
         free(resp);
-        return -1;
+        return -(rc ? rc : SANE_STATUS_IO_ERROR);
     }
 
-    int result = -1;
-
-    const char *p = strstr((char *)resp, "PaperInADF");
-
-    if (p) {
-        const char *gt = strchr(p, '>');
-
-        if (gt) {
-            ++gt;
-
-            if (strncmp(gt, "true", 4) == 0 ||
-                strncmp(gt, "1", 1) == 0) {
-                result = 1;
-            } else if (strncmp(gt, "false", 5) == 0 ||
-                       strncmp(gt, "0", 1) == 0) {
-                result = 0;
-            }
-        }
+    if (scanner_media_jam((char *)resp)) {
+        debug_log("ScannerStateReason=MediaJam");
+        free(resp);
+        return -SANE_STATUS_JAMMED;
     }
+    int result = xml_boolean((char *)resp, "PaperInADF");
+    debug_log("PaperInADF=%d", result);
+    if (result < 0) result = -SANE_STATUS_IO_ERROR;
 
     free(resp);
     return result;
@@ -567,7 +615,7 @@ __attribute__((visibility("default")))
 int bb_is_paper_in_adf(struct soap_session *ps)
 {
     if (!ps || !ps->bb_session)
-        return -1;
+        return -SANE_STATUS_IO_ERROR;
 
     struct bb_state *st =
         (struct bb_state *)ps->bb_session;
@@ -605,60 +653,43 @@ __attribute__((visibility("default")))
 int bb_start_scan(struct soap_session *ps)
 {
     if (!ps || !ps->bb_session)
-        return 1;
+        return SANE_STATUS_IO_ERROR;
 
     struct bb_state *st = (struct bb_state *)ps->bb_session;
     const int is_adf =
         (ps->currentInputSource == IS_ADF ||
          ps->currentInputSource == IS_ADF_DUPLEX);
 
-    if (ps->currentInputSource != IS_PLATEN &&
-        ps->currentInputSource != IS_ADF) {
-        return 1;
-    }
+    const struct source_caps *caps = selected_caps(ps);
+    if (!caps) return SANE_STATUS_INVAL;
+    if (ps->user_cancel) return SANE_STATUS_CANCELLED;
 
     /*
      * The M127fn supports simplex ADF only. Keep the same SOAPHT JobId
      * across ADF pages; each subsequent RetrieveImage returns the next page.
      */
-/*
- * Previous page JPEG data is no longer needed.
- */
-free_image(st);
+    /* Retain one JobId and its geometry for successful ADF pages only. */
+    free_image(st);
+    ps->cnt = ps->index = 0;
+    if (st->cancel_pending || (st->job_active && !(is_adf && st->job_is_adf))) {
+        int rc = cancel_job(ps, st);
+        if (rc) return rc;
+    }
+    if (is_adf && st->job_active && st->job_id > 0)
+        return SANE_STATUS_GOOD;
 
-/*
- * An ADF batch uses one SOAPHT job for all pages.
- *
- * Keep the image geometry returned by CreateScanJob because the next
- * page uses the same scan ticket and therefore the same raster geometry.
- */
-if (is_adf && st->job_active && st->job_id > 0)
-    return 0;
-
-/*
- * Starting a completely new scan job.
- */
-st->job_id = 0;
-st->job_active = 0;
-st->pixels_per_line = 0;
-st->lines = 0;
-st->bytes_per_line = 0;
+    st->job_id = 0;
+    st->job_active = 0;
+    st->pixels_per_line = 0;
+    st->lines = 0;
+    st->bytes_per_line = 0;
 
     if (ps->currentCompression != SF_JFIF)
         ps->currentCompression = SF_JFIF;
 
-    if (is_adf) {
-        if (ps->currentResolution != 150 &&
-            ps->currentResolution != 300) {
-            ps->currentResolution = 300;
-        }
-    } else {
-        if (ps->currentResolution != 150 &&
-            ps->currentResolution != 300 &&
-            ps->currentResolution != 600) {
-            ps->currentResolution = 300;
-        }
-    }
+    ps->currentResolution = source_dpi(caps, ps->currentResolution);
+    if ((ps->currentScanMode == CE_GRAY8 && !caps->gray) ||
+        (ps->currentScanMode == CE_RGB24 && !caps->color)) return SANE_STATUS_INVAL;
 
     const char *color_processing;
     switch (ps->currentScanMode) {
@@ -669,46 +700,27 @@ st->bytes_per_line = 0;
             color_processing = "GrayScale8";
             break;
         default:
-            return 1;
+            return SANE_STATUS_IO_ERROR;
     }
 
-const char *source_name = is_adf ? "ADF" : "Platen";
+    const char *source_name = is_adf ? "ADF" : "Platen";
 
-int x_offset = mm_fixed_to_thou(ps->effectiveTlx);
-int y_offset = mm_fixed_to_thou(ps->effectiveTly);
+    int x_offset = mm_fixed_to_thou(ps->effectiveTlx);
+    int y_offset = mm_fixed_to_thou(ps->effectiveTly);
 
-int media_width =
-    mm_fixed_to_thou(ps->effectiveBrx - ps->effectiveTlx);
+    int media_width =
+        mm_fixed_to_thou(ps->effectiveBrx - ps->effectiveTlx);
 
-int media_height =
-    mm_fixed_to_thou(ps->effectiveBry - ps->effectiveTly);
+    int media_height =
+        mm_fixed_to_thou(ps->effectiveBry - ps->effectiveTly);
 
-/* Fallback for uninitialized/invalid geometry. */
-if (media_width <= 0)
-    media_width = 8499;
-
-if (media_height <= 0)
-    media_height = 11689;
-
-/* Clamp to scanner hardware limits. */
-if (media_width > M127_ADF_WIDTH_THOU)
-    media_width = M127_ADF_WIDTH_THOU;
-
-if (is_adf) {
-    /*
-     * HPLIP initializes the ADF geometry to its advertised maximum
-     * 14-inch height. That produces an unnecessary blank tail for the
-     * normal default scan, so retain the tested A4-ish default.
-     */
-    if (media_height >= M127_ADF_HEIGHT_THOU - 1)
-        media_height = 11689;
-
-    if (media_height > M127_ADF_HEIGHT_THOU)
-        media_height = M127_ADF_HEIGHT_THOU;
-} else {
-    if (media_height > M127_PLATEN_HEIGHT_THOU)
-        media_height = M127_PLATEN_HEIGHT_THOU;
-}
+    /* Uninitialized callers use this source's bounds; explicit geometry is
+     * preserved, including Legal. Never substitute another model's limits. */
+    if (media_width <= 0) media_width = caps->max_width;
+    if (media_height <= 0) media_height = is_adf && caps->max_height > 11689 ? 11689 : caps->max_height;
+    if (x_offset >= caps->max_width || y_offset >= caps->max_height) return SANE_STATUS_INVAL;
+    if (media_width > caps->max_width - x_offset) media_width = caps->max_width - x_offset;
+    if (media_height > caps->max_height - y_offset) media_height = caps->max_height - y_offset;
 
     char inner[4096];
     int n = snprintf(
@@ -754,8 +766,8 @@ if (is_adf) {
         media_height,
         ps->currentContrast,
         ps->currentBrightness,
-       x_offset,
-       y_offset,
+        x_offset,
+        y_offset,
         media_width,
         media_height,
         color_processing,
@@ -763,11 +775,11 @@ if (is_adf) {
         ps->currentResolution);
 
     if (n < 0 || (size_t)n >= sizeof(inner))
-        return 1;
+        return SANE_STATUS_IO_ERROR;
 
     char *xml = make_envelope(inner);
     if (!xml)
-        return 1;
+        return SANE_STATUS_NO_MEM;
 
     unsigned char *resp = NULL;
     size_t resp_len = 0;
@@ -778,15 +790,30 @@ if (is_adf) {
 
     if (rc || !resp) {
         free(resp);
-        return 1;
+        return rc ? rc : SANE_STATUS_IO_ERROR;
     }
 
-    if (tag_int((char *)resp, "JobId", &st->job_id) ||
-        tag_int((char *)resp, "PixelsPerLine", &st->pixels_per_line) ||
-        tag_int((char *)resp, "NumberOfLines", &st->lines) ||
-        tag_int((char *)resp, "BytesPerLine", &st->bytes_per_line)) {
+    if (tag_int((char *)resp, "JobId", &st->job_id)) {
+        debug_log("CreateScanJob returned no valid JobId: %.1024s", resp);
         free(resp);
-        return 1;
+        return SANE_STATUS_IO_ERROR;
+    }
+    /* From here on we own a real job, even if its metadata is malformed. */
+    st->job_active = 1;
+    st->job_is_adf = is_adf;
+    if (ps->user_cancel) {
+        free(resp);
+        bb_end_scan(ps, 0);
+        return SANE_STATUS_CANCELLED;
+    }
+    if (tag_int((char *)resp, "PixelsPerLine", &st->pixels_per_line) ||
+        tag_int((char *)resp, "NumberOfLines", &st->lines) ||
+        tag_int((char *)resp, "BytesPerLine", &st->bytes_per_line) ||
+        st->pixels_per_line > INT_MAX / 3) {
+        debug_log("invalid image metadata for JobId=%d", st->job_id);
+        free(resp);
+        bb_end_scan(ps, 1);
+        return SANE_STATUS_IO_ERROR;
     }
 
     free(resp);
@@ -821,6 +848,8 @@ static int extract_dime_jpeg(const unsigned char *body,
     unsigned char *out = NULL;
     size_t out_len = 0;
     int image_started = 0;
+    int status = SANE_STATUS_IO_ERROR;
+    const char *reason = "no complete JFIF record";
 
     while (pos + 12 <= body_len) {
         const unsigned char *h = body + pos;
@@ -836,6 +865,10 @@ static int extract_dime_jpeg(const unsigned char *body,
          */
         unsigned char flags = h[0];
         int cf = (flags & 0x01) != 0;
+        if ((flags >> 3) != 1 || (cf && (flags & 0x02))) {
+            reason = "invalid DIME flags";
+            goto fail;
+        }
 
         uint16_t options_len = be16(h + 2);
         uint16_t id_len = be16(h + 4);
@@ -850,8 +883,12 @@ static int extract_dime_jpeg(const unsigned char *body,
         size_t data_pos = type_pos + pad4(type_len);
         size_t next_pos = data_pos + pad4(data_len);
 
-        if (next_pos > body_len)
+        if (data_len > SOAPHT_MAX_RESPONSE || next_pos > body_len) {
+            reason = "DIME record exceeds response";
             goto fail;
+        }
+        debug_log("DIME record: flags=0x%02x type=%.*s data=%u", flags,
+                  type_len > 80 ? 80 : (int)type_len, body + type_pos, data_len);
 
         if (!image_started &&
             type_len == strlen("image/jfif") &&
@@ -860,9 +897,16 @@ static int extract_dime_jpeg(const unsigned char *body,
         }
 
         if (image_started && data_len > 0) {
-            unsigned char *tmp = realloc(out, out_len + data_len);
-            if (!tmp)
+            if (out_len + data_len > SOAPHT_MAX_RESPONSE) {
+                reason = "JPEG exceeds response limit";
                 goto fail;
+            }
+            unsigned char *tmp = realloc(out, out_len + data_len);
+            if (!tmp) {
+                status = SANE_STATUS_NO_MEM;
+                reason = "JPEG allocation failed";
+                goto fail;
+            }
 
             out = tmp;
             memcpy(out + out_len, body + data_pos, data_len);
@@ -875,6 +919,10 @@ static int extract_dime_jpeg(const unsigned char *body,
                 out[1] != 0xd8 ||
                 out[out_len - 2] != 0xff ||
                 out[out_len - 1] != 0xd9) {
+                reason = "missing JPEG SOI/EOI";
+                if (out_len >= 4)
+                    debug_log("JPEG boundary: first=%02x%02x last=%02x%02x",
+                              out[0], out[1], out[out_len - 2], out[out_len - 1]);
                 goto fail;
             }
 
@@ -887,8 +935,10 @@ static int extract_dime_jpeg(const unsigned char *body,
     }
 
 fail:
+    debug_log("DIME extraction failed: %s (body=%zu offset=%zu jpeg=%zu)",
+              reason, body_len, pos, out_len);
     free(out);
-    return 1;
+    return status;
 }
 
 static int fetch_jpeg(struct soap_session *ps, struct bb_state *st)
@@ -903,11 +953,11 @@ static int fetch_jpeg(struct soap_session *ps, struct bb_state *st)
         st->job_id);
 
     if (n < 0 || (size_t)n >= sizeof(inner))
-        return 1;
+        return SANE_STATUS_IO_ERROR;
 
     char *xml = make_envelope(inner);
     if (!xml)
-        return 1;
+        return SANE_STATUS_NO_MEM;
 
     unsigned char *body = NULL;
     size_t body_len = 0;
@@ -918,15 +968,22 @@ static int fetch_jpeg(struct soap_session *ps, struct bb_state *st)
 
     if (rc) {
         free(body);
-        return 1;
+        return rc;
     }
 
     unsigned char *jpeg = NULL;
     size_t jpeg_len = 0;
 
-    if (extract_dime_jpeg(body, body_len, &jpeg, &jpeg_len)) {
+    rc = extract_dime_jpeg(body, body_len, &jpeg, &jpeg_len);
+    if (rc) {
         free(body);
-        return 1;
+        /* A jam can truncate an otherwise complete HTTP/DIME response.
+         * Query status once; never retry image acquisition or mask an unknown
+         * malformed image as an empty feeder. Preserve other original errors. */
+        if (rc == SANE_STATUS_IO_ERROR && st->job_is_adf &&
+            query_paper_in_adf(ps) == -SANE_STATUS_JAMMED)
+            return SANE_STATUS_JAMMED;
+        return rc;
     }
 
     free(body);
@@ -940,16 +997,22 @@ static int fetch_jpeg(struct soap_session *ps, struct bb_state *st)
 __attribute__((visibility("default")))
 int bb_get_image_data(struct soap_session *ps, int max_length)
 {
-    if (!ps || !ps->bb_session) return 1;
+    if (!ps || !ps->bb_session) return SANE_STATUS_IO_ERROR;
     struct bb_state *st = (struct bb_state *)ps->bb_session;
 
     /* soapht.c may call us while unconsumed input remains. */
+    if (ps->user_cancel) return SANE_STATUS_CANCELLED;
     if (ps->cnt > 0)
         return 0;
 
     if (!st->jpeg) {
-        if (!st->job_active || fetch_jpeg(ps, st))
-            return 1;
+        if (!st->job_active || st->cancel_pending)
+            return SANE_STATUS_IO_ERROR;
+        int rc = fetch_jpeg(ps, st);
+        if (rc) {
+            bb_end_scan(ps, 1);
+            return rc;
+        }
     }
 
     if (st->jpeg_off >= st->jpeg_size) {
@@ -972,7 +1035,8 @@ int bb_get_image_data(struct soap_session *ps, int max_length)
 __attribute__((visibility("default")))
 int bb_end_page(struct soap_session *ps, int io_error)
 {
-    (void)io_error;
+    if (io_error)
+        return bb_end_scan(ps, 1);
 
     if (!ps || !ps->bb_session)
         return 0;
@@ -995,6 +1059,7 @@ static int cancel_job(struct soap_session *ps, struct bb_state *st)
     if (!st || !st->job_active || st->job_id <= 0)
         return 0;
 
+    st->cancel_pending = 1;
     char inner[768];
     snprintf(inner, sizeof(inner),
         "<wscn:CancelJobRequest>"
@@ -1002,15 +1067,18 @@ static int cancel_job(struct soap_session *ps, struct bb_state *st)
         "<DocumentDescription></DocumentDescription>"
         "</wscn:CancelJobRequest>", st->job_id);
     char *xml = make_envelope(inner);
-    if (!xml) return 1;
+    if (!xml) return SANE_STATUS_NO_MEM;
 
     unsigned char *resp = NULL;
     size_t resp_len = 0;
-    int rc = soap_transaction(ps, xml, &resp, &resp_len, SOAPHT_TIMEOUT);
+    int rc = soap_transaction_mode(ps, xml, &resp, &resp_len, SOAPHT_CANCEL_TIMEOUT, 1);
     free(xml);
     free(resp);
-    st->job_active = 0;
-    st->job_id = 0;
+    if (!rc) {
+        st->job_active = 0;
+        st->job_id = 0;
+        st->cancel_pending = 0;
+    }
     return rc;
 }
 
@@ -1022,6 +1090,7 @@ int bb_end_scan(struct soap_session *ps, int io_error)
     struct bb_state *st = (struct bb_state *)ps->bb_session;
     int rc = cancel_job(ps, st);
     free_image(st);
+    st->pixels_per_line = st->lines = st->bytes_per_line = 0;
     ps->index = 0;
     ps->cnt = 0;
     return rc;

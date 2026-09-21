@@ -24,7 +24,31 @@
      }
  
      len = ntohs(*(short *)buffer);
-@@ -2156,7 +2171,7 @@
+@@ -906,9 +921,21 @@
+ static int libusb_bulk_read(libusb_device_handle *dev, int ep, char *bytes, int size, int timeout)
+ {
+     int actual_len = 0;
+-
++#ifdef __APPLE__
++    /* Preserve disconnect/errors instead of turning them into empty reads.
++     * libusb timeout=0 is infinite; keep a minimum finite wait. */
++    int result = libusb_bulk_transfer(dev, ep, (unsigned char*)bytes, size,
++                                      &actual_len, timeout > 0 ? timeout : 1);
++    if (result == LIBUSB_ERROR_TIMEOUT)
++        return actual_len > 0 ? actual_len : -ETIMEDOUT;
++    if (result != 0) {
++        errno = EIO;
++        return -EIO;
++    }
++#else
+     libusb_bulk_transfer(dev, ep, (unsigned char*)bytes, size, &actual_len, timeout);
+-    return actual_len ;
++#endif
++    return actual_len;
+ }
+ 
+ static int libusb_bulk_write(libusb_device_handle *dev, int ep, char *bytes, int size, int timeout)
+@@ -2156,7 +2183,7 @@
      }//end for loop
  
  bugout:

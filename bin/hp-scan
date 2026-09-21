@@ -44,6 +44,7 @@ MODE="Color"
 SOURCE="Flatbed"
 PAGE_SIZE=""
 BATCH=0
+DEV=""
 
 usage()
 {
@@ -52,6 +53,9 @@ Usage:
   hp-scan [options] [output_path]
 
 Options:
+  --device URI
+      Select an HPAIO scanner explicitly (default: first detected HPAIO device).
+
   --source SOURCE
       Flatbed or ADF
       Default: Flatbed
@@ -210,6 +214,14 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+        --device)
+            if [[ $# -lt 2 || "$2" != hpaio:* ]]; then
+                echo "ERROR: --device requires an hpaio: URI." >&2
+                exit 2
+            fi
+            DEV="$2"
+            shift 2
+            ;;
         --resolution)
             [[ $# -ge 2 ]] || {
                 echo "ERROR: --resolution requires a value." >&2
@@ -306,15 +318,6 @@ case "$RES" in
         ;;
 esac
 
-#
-# M127fn ADF optical resolution is 300 dpi.
-#
-if [[ "$SOURCE" == "ADF" && "$RES" == "600" ]]; then
-    echo "ERROR: 600 dpi is not supported by the M127fn ADF." >&2
-    echo "Use 150 or 300 dpi." >&2
-    exit 2
-fi
-
 # ??
 # batch
 #
@@ -336,14 +339,6 @@ fi
 #
 # ??
 #
-
-#
-# Legal is longer than the M127fn flatbed.
-#
-if [[ "$SOURCE" == "Flatbed" && "$PAGE_SIZE" == "Legal" ]]; then
-    echo "ERROR: Legal page size requires the ADF on the M127fn." >&2
-    exit 2
-fi
 
 #
 # Convert page-size presets to SANE geometry in millimetres.
@@ -387,17 +382,41 @@ esac
 #
 # Auto-detect first HPAIO device.
 #
+if [[ -z "$DEV" ]]; then
 DEV="$(
     scanimage -L 2>/dev/null |
     sed -n "s/^device \`\([^']*\)'.*/\1/p" |
-    head -n 1
+    awk '/^hpaio:/ && !found++ {print}'
 )"
+fi
 
 if [[ -z "${DEV:-}" ]]; then
     echo "✗ no HP scanner detected."
     echo "  Is the printer powered on and USB connected?"
     echo "  Run 'scanimage -L' to debug."
     exit 1
+fi
+
+# Previously these requests were rejected for every device using M127 limits.
+# Query only those cases; keep ordinary M127 scans and option ordering unchanged.
+if [[ ( "$SOURCE" == "ADF" && "$RES" == "600" ) ||
+      ( "$SOURCE" == "Flatbed" && "$PAGE_SIZE" == "Legal" ) ]]; then
+    OPTIONS="$(scanimage -d "$DEV" --source "$SOURCE" --format=jpeg -A)" || exit 1
+    if [[ "$SOURCE" == "ADF" && "$RES" == "600" ]]; then
+        ALLOWED="$(printf '%s\n' "$OPTIONS" | awk '$1 == "--resolution" {print $2; exit}')"
+        case "|${ALLOWED%dpi}|" in
+            *'|600|'*) ;;
+            *) echo "ERROR: this ADF does not advertise 600 dpi. Use a listed resolution." >&2; exit 2 ;;
+        esac
+    fi
+    if [[ "$SOURCE" == "Flatbed" && "$PAGE_SIZE" == "Legal" ]]; then
+        MAX_HEIGHT="$(printf '%s\n' "$OPTIONS" | awk '$1 == "-y" {v=$2; sub(/^.*\.\./,"",v); sub(/mm$/,"",v); print v; exit}')"
+        MAX_WIDTH="$(printf '%s\n' "$OPTIONS" | awk '$1 == "-x" {v=$2; sub(/^.*\.\./,"",v); sub(/mm$/,"",v); print v; exit}')"
+        if ! awk -v height="$MAX_HEIGHT" -v width="$MAX_WIDTH" 'BEGIN {exit !(height ~ /^[0-9]+([.][0-9]+)?$/ && width ~ /^[0-9]+([.][0-9]+)?$/ && height+0 >= 355.6 && width+0 >= 215.9)}'; then
+            echo "ERROR: this flatbed does not advertise Legal height. Use the ADF." >&2
+            exit 2
+        fi
+    fi
 fi
 
 TMP="$(mktemp -d)"
@@ -431,9 +450,19 @@ fi
 if [[ "$BATCH" -eq 1 ]]; then
     echo "→ batch mode: scanning all ADF pages ..."
 
-    scanimage \
+    if scanimage \
         "${SCAN_ARGS[@]}" \
-        --batch="$TMP/page-%03d.jpg"
+        --batch="$TMP/page-%03d.jpg"; then
+        :
+    else
+        scan_status=$?
+        # A later-page error must not delete pages already acquired. Keep the
+        # original failure status; do not publish an incomplete PDF as success.
+        trap - EXIT
+        echo "ERROR: batch failed (scanimage exit $scan_status)." >&2
+        echo "Retained scan files (possibly incomplete): $TMP" >&2
+        exit "$scan_status"
+    fi
 
     shopt -s nullglob
     JPEG_PAGES=("$TMP"/page-*.jpg)
