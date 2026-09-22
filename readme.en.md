@@ -136,6 +136,12 @@ select a device explicitly.
 
 ## Image Capture / Preview
 
+An optional WSD network path is available through `AIRSCAN_WSD_URL`, alongside
+the existing USB mode. On the M127fn, Image Capture completed Flatbed scanning
+and a Color 300 DPI two-page ADF PDF with automatic batch termination.
+See [WSD network scanning](docs/WSD_NETWORK.md) for setup
+and the exact physical/native-app validation status.
+
 The local eSCL bridge negotiates the installed scanner's source, DPI and geometry
 options and keeps one SANE process per multi-page job. Its listener and Bonjour
 registration are local to this Mac. Build with `./airscan-bridge/build.sh`, then

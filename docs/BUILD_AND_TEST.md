@@ -42,6 +42,20 @@ partial timeouts, disconnection and finite waits, and exercises the real wrapper
 with a fake scanimage to check geometry argument routing. These tests do not establish
 physical feed behavior or image quality.
 
+## AirScan bridge regression
+
+For the Go AirScan bridge (USB and optional WSD transport), run separately:
+
+```bash
+(cd airscan-bridge && go test -race ./... && go vet ./...)
+```
+
+WSD tests use an HTTP scanner simulator and the M127fn capability fixture. They
+cover image decoding, batch termination, retained pages after failure, busy and
+cancel recovery, ambiguous creation, and permission/offline startup retries.
+They do not require HPLIP or feed paper. See [WSD_NETWORK.md](WSD_NETWORK.md) for
+LAN installation and the separate physical/native-app validation boundary.
+
 ## Repeated build regression
 
 The build explicitly runs configure, applies the macOS Makefile edits, then

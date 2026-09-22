@@ -28,6 +28,7 @@ type Source struct {
 }
 type Device struct {
 	URI, Model string
+	Transport  string
 	Sources    []Source
 }
 

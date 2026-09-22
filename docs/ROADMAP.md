@@ -53,6 +53,10 @@
 
 - [ ] Polished installer/uninstaller and release artifacts
 - [x] Capability-driven local eSCL bridge and per-user Bonjour/LaunchAgent service
+- [x] Optional WSD transport, BMP conversion and simulated batch/cancel recovery
+- [x] WSD LaunchAgent Local Network permission and Image Capture Flatbed acquisition
+- [x] WSD Image Capture ADF two-page PDF and automatic batch termination
+- [ ] WSD Preview, physical jam recovery and native-client cancel/restart validation
 - [x] Image Capture discovery and repeated Flatbed acquisition
 - [x] Native crop boundary conversion regression and completed/canceled job cleanup tests
 - [x] Image Capture ADF JPEG/PDF batch and native-client cancel/restart

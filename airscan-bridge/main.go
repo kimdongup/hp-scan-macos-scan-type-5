@@ -42,6 +42,7 @@ type Job struct {
 type Bridge struct {
 	mu                     sync.Mutex
 	Device                 Device
+	WSD                    *WSDClient
 	Scanimage, Probe       string
 	Jobs                   map[string]*Job
 	Active                 *Job
@@ -71,14 +72,20 @@ func xmlResponse(w http.ResponseWriter, s string) {
 func (b *Bridge) status(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.Active == nil && b.Probe != "" && time.Since(b.LastProbe) > 3*time.Second && time.Now().After(b.ReadyAfter) {
+	if b.Active == nil && (b.Probe != "" || b.WSD != nil) && time.Since(b.LastProbe) > 3*time.Second && time.Now().After(b.ReadyAfter) {
 		b.LastProbe = time.Now()
-		data, e := outputCommand(b.Probe, b.Device.URI)
-		if e != nil {
-			b.ScannerState = "Stopped"
-			b.AdfState = "ScannerAdfUnknown"
+		if b.WSD != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			b.ScannerState, b.AdfState, _ = b.WSD.status(ctx)
+			cancel()
 		} else {
-			b.ScannerState, b.AdfState = parseStatus(data)
+			data, e := outputCommand(b.Probe, b.Device.URI)
+			if e != nil {
+				b.ScannerState = "Stopped"
+				b.AdfState = "ScannerAdfUnknown"
+			} else {
+				b.ScannerState, b.AdfState = parseStatus(data)
+			}
 		}
 	}
 	state, adf := b.ScannerState, b.AdfState
@@ -264,6 +271,10 @@ func (b *Bridge) run(j *Job) {
 		b.finish(j, nil, "")
 		return
 	default:
+	}
+	if b.WSD != nil {
+		b.runWSD(j)
+		return
 	}
 	cmd := exec.Command(b.Scanimage, j.Settings.args(b.Device.URI, j.Dir)...)
 	cmd.Env = commandEnv()
@@ -629,13 +640,19 @@ func advertise(ctx context.Context, d Device, port int) error {
 			}
 		}
 	}
-	args := []string{"-lo", "-P", d.Model + " (SOAPHT)", "_uscan._tcp", "local", strconv.Itoa(port), host, "127.0.0.1", "txtvers=1", "vers=2.6", "ty=" + d.Model, "UUID=" + uuid, "rs=eSCL", "pdl=image/jpeg", "cs=" + strings.Join(colors, ","), "is=" + strings.Join(sources, ","), "duplex=F"}
+	label := "SOAPHT"
+	if d.Transport != "" {
+		label = d.Transport
+	}
+	args := []string{"-lo", "-P", d.Model + " (" + label + ")", "_uscan._tcp", "local", strconv.Itoa(port), host, "127.0.0.1", "txtvers=1", "vers=2.6", "ty=" + d.Model, "UUID=" + uuid, "rs=eSCL", "pdl=image/jpeg", "cs=" + strings.Join(colors, ","), "is=" + strings.Join(sources, ","), "duplex=F"}
 	cmd := exec.CommandContext(ctx, "/usr/bin/dns-sd", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	scanimage := os.Getenv("AIRSCAN_SCANIMAGE")
 	if scanimage == "" {
 		scanimage = "/opt/homebrew/bin/scanimage"
@@ -644,19 +661,45 @@ func main() {
 	if probe == "" {
 		probe = "/opt/homebrew/bin/hp-soapht-probe"
 	}
-	d, e := detectDevice(scanimage, os.Getenv("AIRSCAN_DEVICE"))
-	if e != nil {
-		log.Fatal(e)
+	var d Device
+	var e error
+	var wsd *WSDClient
+	if endpoint := os.Getenv("AIRSCAN_WSD_URL"); endpoint != "" {
+		if os.Getenv("AIRSCAN_DEVICE") != "" {
+			log.Fatal("choose either AIRSCAN_WSD_URL or AIRSCAN_DEVICE")
+		}
+		wsd, e = newWSDClient(endpoint)
+		if e != nil {
+			log.Fatal(e)
+		}
+		d, e = waitWSDDevice(ctx, wsd.device, 30*time.Second)
+		if e != nil {
+			return
+		}
+	} else {
+		d, e = detectDevice(scanimage, os.Getenv("AIRSCAN_DEVICE"))
+		if e != nil {
+			log.Fatal(e)
+		}
+		// The probe validates HPLIP scan-type=5 before any Bonjour advertisement.
+		caps, e := outputCommand(probe, d.URI)
+		if e != nil {
+			log.Fatalf("SOAPHT capability probe: %v", e)
+		}
+		if e = d.applyMinimums(caps); e != nil {
+			log.Fatalf("SOAPHT minimum geometry: %v", e)
+		}
+
 	}
-	// The probe validates HPLIP scan-type=5 before any Bonjour advertisement.
-	caps, e := outputCommand(probe, d.URI)
-	if e != nil {
-		log.Fatalf("SOAPHT capability probe: %v", e)
-	}
-	if e = d.applyMinimums(caps); e != nil {
-		log.Fatalf("SOAPHT minimum geometry: %v", e)
+	if name := strings.TrimSpace(os.Getenv("AIRSCAN_NAME")); name != "" {
+		if len(name) > 80 {
+			log.Fatal("AIRSCAN_NAME must be at most 80 bytes")
+		}
+		d.Model = name
 	}
 	b := newBridge(d, scanimage, probe)
+	b.WSD = wsd
+
 	port := 8089
 	if v := os.Getenv("AIRSCAN_PORT"); v != "" {
 		port, e = strconv.Atoi(v)
@@ -668,8 +711,6 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 	srv := &http.Server{Handler: b, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	go func() {
 		if e := srv.Serve(listener); e != nil && !errors.Is(e, http.ErrServerClosed) {

@@ -1,12 +1,14 @@
 # Local AirScan / eSCL integration
 
-The bridge exposes an installed HPAIO SOAPHT scanner to macOS Image Capture and
-Preview. It listens only on **127.0.0.1**, with a Bonjour `_uscan._tcp` proxy
+The bridge exposes either an installed HPAIO SOAPHT USB scanner or an explicitly
+configured WSD network scanner to macOS Image Capture and Preview. It listens only on **127.0.0.1**, with a Bonjour `_uscan._tcp` proxy
 registered on the **LocalOnly** interface. It does not share the scanner with
 other Macs, phones or the LAN. The USB driver and command-line wrapper remain
 independent of this service.
 
-## Build and start
+For LAN/WSD setup and validation boundaries, see [WSD_NETWORK.md](WSD_NETWORK.md).
+
+## Build and start (USB)
 
 Install the native backend using `./build.sh` first. With Go installed, that build
 also builds the bridge and its read-only `hp-soapht-probe` helper, including when
@@ -17,8 +19,8 @@ HPLIP_SRC=/tmp/hplip-build/hplip-3.25.8 ./airscan-bridge/build.sh
 ./airscan-bridge/service.sh install
 ```
 
-This installs per-user binaries under
-`~/Library/Application Support/HP SOAPHT AirScan/` and a LaunchAgent named
+This installs `~/Applications/HP AirScan Bridge.app`, the USB probe helper under
+`~/Library/Application Support/HP SOAPHT AirScan/`, and a LaunchAgent named
 `io.github.kimdongup.hp-soapht-airscan`. It starts immediately and at login.
 No administrator password is required for this per-user service. The old
 `com.nricaurte.hp-airscan.plist` sample is superseded by `service.sh`.

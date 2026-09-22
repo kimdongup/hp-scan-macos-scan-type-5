@@ -269,6 +269,11 @@ HPLIP 3.25.8에는 scan-type=5 모델 식별자 105개가 있습니다. 이들�
 
 ## macOS Image Capture / Preview
 
+LAN 연결에는 별도의 WSD 경로를 추가했습니다. USB 모드는 그대로 유지하며,
+`AIRSCAN_WSD_URL`을 지정하면 WSD → 로컬 AirScan 방식으로 연결합니다.
+M127fn에서 Image Capture의 Flatbed 스캔과 ADF 컬러 300dpi 2장 PDF·자동 종료를 확인했습니다.
+설치 방법과 실제 검증 범위는 [WSD 네트워크 스캔](docs/WSD_NETWORK.md)을 참고하십시오.
+
 로컬 AirScan/eSCL 브리지를 추가했습니다. 설치된 SOAPHT 장치의 실제 source·DPI·geometry를
 광고하고, ADF 여러 페이지를 한 SANE 작업으로 전달합니다. 서버와 Bonjour 등록은 이 Mac
 전용이며 LAN에는 공개하지 않습니다.

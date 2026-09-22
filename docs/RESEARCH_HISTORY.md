@@ -236,3 +236,35 @@ scanimage with debug disabled. A read-only runtime trace confirmed the installed
 libraries/plugin, and the restarted local-only service advertised the expected
 Flatbed/ADF geometry and reported Idle with no retained jobs. No additional
 physical acquisition was performed after this promotion.
+
+### Ethernet WS-Scan transport (2026-09-21)
+
+After switching the M127fn from USB to Ethernet, print discovery remained usable
+but did not establish scan support. The web server returned eSCL capability and
+status XML, yet rejected POST /eSCL/ScanJobs with HTTP 404. WS-Discovery metadata
+instead exposed an operational WS-Scan ScannerService at port 3911.
+
+A minimal WSD scan ticket produced a Color 150 Flatbed page and two ADF pages;
+the next retrieval returned ClientErrorNoImagesAvailable and cleanup returned
+the device to Idle. The Go bridge now has an explicit, optional WSD transport
+with capability negotiation, BMP/DIB conversion, batch spooling and bounded
+cancellation. A physical bridge cancellation followed by a new Color 300 Letter
+Flatbed scan succeeded without restarting the process. Firmware returned a
+2528 × 3300 raster for a nominal 2550-column request; actual pixels are retained.
+
+The same executable initially failed from launchd with a kernel NECP denial,
+despite connecting successfully when run interactively. Following Apple's Local
+Network guidance, service installation now supplies a responsible app bundle,
+usage description and AssociatedBundleIdentifiers. Startup remains alive while
+retrying read-only capability queries so macOS can present its permission alert.
+The user then granted permission. Without restarting, the LaunchAgent connected,
+advertised the WSD scanner, and completed a Color 300 Letter Flatbed scan via
+the local eSCL endpoint. The JPEG fully decoded and status returned Idle with no
+retained jobs. Image Capture subsequently discovered the WSD service, completed
+an overview and saved a Gray 300 Letter JPEG (2528 × 3300, fully decoded). Its
+Scan button became enabled again after completion. A subsequent Image Capture
+ADF Color 300 Letter batch saved two distinct readable pages into one PDF and
+automatically ended after the second page. Both PDF pages rendered successfully;
+the app re-enabled Scan and the service returned Idle with no jobs. Preview,
+physical jam recovery and native-client cancellation over WSD remain open. See
+[WSD_NETWORK.md](WSD_NETWORK.md) for evidence and current limitations.
